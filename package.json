@@ -1,0 +1,8 @@
+{
+  "name": "agent-skills",
+  "private": true,
+  "description": "Agent skills of the dapr-cn organization. Tests live in tests/ and are not part of any skill folder.",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.mjs\""
+  }
+}
