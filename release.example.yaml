@@ -1,0 +1,35 @@
+# release.yaml — template for one translated Dapr docs version.
+#
+# Copy this file to <zh repo>/translations/release.yaml (for example repos/v1.18_zh/translations/release.yaml) and fill it in.
+# It is maintained by hand: the skills read it and never rewrite it. Every field below is required unless marked optional.
+# Validation: every skill checks this structure before it uses the file, and a missing field is reported by name,
+# never filled with a default.
+
+# Format version of this file. Must be the number 1.
+schema: 1
+
+# The Dapr docs version this translation targets, written vX.Y. It is the version every command is given (--version), unless
+# a command line overrides it. Must match the version of the repos/vX.Y and repos/vX.Y_zh entries in .hagicode/monospecs.yaml.
+version: v1.17
+
+# Optional. The version whose _content branch the new version was bootstrapped from. When omitted, the bootstrap step
+# detects the largest lower version that has a _content branch on the remote.
+# previousVersion: v1.15
+
+# Paths (relative to the zh repo) that zh:data:sync regenerates. The verification gate reports changes to these paths as
+# `blocked` ("sync output: commit by hand"), because the translation skills commit only translations/ and translated_content/.
+# Use [] when a version has no sync output. Usually [data/].
+syncOutputPaths:
+  - data/
+
+# Where the translations are offered upstream. Used only by dapr-docs-upstream-pr.
+upstreamPr:
+  forkDocs:
+    # Local checkout of the fork of dapr/docs that holds the translations/docs-zh submodule. Relative to the mono root.
+    path: repos/fork-docs
+    # Submodule inside path that points at the translated commit. Relative to path.
+    submodulePath: translations/docs-zh
+    # Upstream repository the pull request is opened against. Must be the dapr/docs repository for this version.
+    upstreamUrl: https://github.com/dapr/docs.git
+    # Upstream branch the pull request targets. Must be the same version as `version` (for example v1.17).
+    upstreamBranch: v1.17
