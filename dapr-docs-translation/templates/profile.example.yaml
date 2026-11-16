@@ -44,6 +44,10 @@ commit:
 timezone: America/Los_Angeles
 
 rules:
+  # checks:                             # opt-in tolerances matching an existing translation convention (default: strict)
+  #   fenceComments: translate           # fenced code identical except comment text
+  #   inlinePlaceholders: translate      # inline-code prose placeholders may be translated one for one
+  #   localizedUrls: allow               # external URLs may gain a leading /zh-cn/ style locale segment
   doNotTranslateSeeds: []
   links: keep relative links unchanged
   frontmatterTranslatable: [title, description]
