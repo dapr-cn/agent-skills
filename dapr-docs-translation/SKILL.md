@@ -37,6 +37,8 @@ description: 'Unattended, resumable documentation translation with durable state
 | 5 | `tr.mjs next` 出任务 → 便宜模型 subagent 并行翻译 → `check` → 复审(仅带标记的)→ `finalize`(**接受文档时自动把 subagent 的术语候选并入术语表**)/ `fail` | `references/translation-procedure.md`、`references/commands.md` |
 | 6 | 收尾:整理术语表、写运行记录、`tr.mjs status` 核对完成度、只提交译文目录、释放锁、给出摘要 | `references/run-and-report.md` |
 
+已完成的译文校验不过(`status --verify`):`tr.mjs triage` 分类 → `fix-punctuation` / `fix-anchors` 脚本修 → `requeue --triage retranslate` 送回待办,不要手改结构。
+
 没有待办时不要硬找活干,走 `references/run-and-report.md` 的"无待办"一节。
 
 新接入一个仓库:`node <SKILL_DIR>/scripts/tr.mjs init --repo <repo> --source-root <docs 目录> --glob "**/*.md" --locale zh-CN` 生成 `translations/`(profile、README、各语言目录),再按 `references/profile-spec.md` 补全 profile。源文档来自上游子模块等没有现成 glob 的情况,改用 profile 的 `sources.discovery` 适配器。
@@ -79,6 +81,6 @@ dapr-docs-translation/
     └── translations-README.md       # 翻译根目录说明模板(首次运行时复制过去)
 ```
 
-脚本只依赖 Node 内置模块(含 profile 的 YAML 解析;`check-translation.mjs` 在能解析到 `github-slugger` 时额外核对锚点,所以请在目标仓库根目录运行)。所有命令的细则见 `references/commands.md`。单元测试不随技能分发,放在技能仓库的 `tests/dapr-docs-translation/`,用 `npm test`(或 `node --test "tests/**/*.test.mjs"`)运行。
+脚本只依赖 Node 内置模块(含 profile 的 YAML 解析;`check-translation.mjs` 内置了锚点 slug 规则)。所有命令的细则见 `references/commands.md`。单元测试不随技能分发,放在技能仓库的 `tests/dapr-docs-translation/`,用 `npm test`(或 `node --test "tests/**/*.test.mjs"`)运行。
 
 `scan`、`status`、`check` 只读,不写仓库。记账优先用 `tr.mjs finalize` / `fail` / `adopt`;底层是 `statectl.mjs`,也可直接用它:加锁、追加台账、读写快照,以及一篇文档完成时的 `doc finalize`(哈希由脚本从文件算出,不手填)。

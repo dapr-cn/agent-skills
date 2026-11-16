@@ -28,11 +28,11 @@ description: 'Daily incremental translation run for a Dapr docs version that is 
 | --- | --- | --- |
 | 1 | 同步仓库 | `pnpm run sync:repos` |
 | 2 | 同步源文(只有这一步写 `data/`) | `pnpm run zh:data:sync --version <v> --source-repo <src> --zh-repo <zh>` |
-| 3 | 盘点待办 | `node <engine>/scripts/tr.mjs scan --profile <zh>/translations/profile.yaml --source-root <zh>/data/source --json` |
+| 3 | 盘点待办 | `node <engine>/scripts/tr.mjs scan --profile <zh>/translations/profile.yaml --source-root data/source --json` |
 | 4 | 翻译待办(主会话) | 按 `dapr-docs-translation/SKILL.md` 的 `next` → subagent 翻译 → `check` → `finalize` |
 | 5 | 核对完成度 | `node <engine>/scripts/tr.mjs status --profile … --source-root …` |
 
-- `--source-root` 来自 profile 的 `sources.glob.root`(相对译文仓库),不是硬编码路径。
+- `--source-root` 来自 profile 的 `sources.glob.root`,写成相对译文仓库的路径(`tr.mjs` 按译文仓库解析它),不是硬编码路径。
 - 任一步以非零退出码结束(或根本无法启动),后续步骤都不再运行,报告指出失败的步骤。第 2 步失败时不盘点、不翻译、不提交。
 - 第 3 步的待办为空时报告「无待办」,跳过第 4 步,仍然运行第 5 步。
 

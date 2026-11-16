@@ -45,7 +45,31 @@
 
 `adopt --profile <p> [--locale L] [--only <glob>]… [--if-translation-newer] [--dry-run] [--run <id>]`
 
-把**已有的、没有记录的译文**(`untracked`)记为基线:当前源哈希与译文哈希写入快照(`adopted: true`),台账记 `doc_adopted`。整批只写一次快照。已有记录的文档不动。`--only` 限定范围;`--if-translation-newer` 只收"译文的最后修改不早于源文"的文档(按各自所在 git 仓库的提交时间,未提交的改动算"现在",不在 git 里的用 mtime),避免把早已过期的译文误当成最新;跳过的文档连同原因一并列出。先 `--dry-run`。会取运行锁(被占用时退出 3)。采纳的基线没有基线源副本,所以之后源文变了只能整篇重译(`incremental: false`),旧译文作参考。
+把**已有的、没有记录的译文**(`untracked`)记为基线:当前源哈希与译文哈希写入快照(`adopted: true`),台账记 `doc_adopted`。整批只写一次快照。已有记录的文档不动。`--only` 限定范围;`--if-translation-newer` 只收"译文的最后修改不早于源文"的文档(按各自所在 git 仓库的提交时间,未提交的改动算"现在",不在 git 里的用 mtime),避免把早已过期的译文误当成最新;跳过的文档连同原因一并列出。`--only-from <file>`(每行一个文档路径)只收清单里的文档,可与 `--only` 叠加。`--as-stale` 把选中的文档记为**过期**而不是最新:译文留作参考,记录里的源哈希是占位值,所以它们进入 `stale` 待办并按"带参考整篇重译"处理——用于译文确实早于现行源文、又不想把它们当成最新的情形。先 `--dry-run`。会取运行锁(被占用时退出 3)。采纳的基线没有基线源副本,所以之后源文变了只能整篇重译(`incremental: false`),旧译文作参考。
+
+## `fix-anchors`
+
+`fix-anchors --profile <p> [--locale L] [--only <glob>]… [--source-root DIR] [--dry-run] [--json] [--run <id>]`
+
+译文标题翻译后,页内锚点会变,`[x](#english-slug)` 随之失效。本命令对源文没变的译文(`fresh`、`edited`、`untracked`)做修复:源文与译文的标题级别序列必须逐一对应,否则跳过并列出原因;对每个指向**源文某个标题**、但在译文里已不再解析的 `#fragment`,改成译文里同一位置标题的 slug(规则同 `check-translation.mjs`,等价于 `github-slugger`)。只改同文档的 `](#…)` 与 `[x]: #…`,不碰代码块和行内代码。`stale` 与未译文档不处理。已有记录的 `fresh` 文档把新哈希写进快照并记 `doc_rehashed`,所以仍是 `fresh`;被人手改过的 `edited` 与 `untracked` 只写文件,不改状态。源文里本来就没有对应标题的 fragment 原样保留并列在 `unresolved`。`--dry-run` 只报告。会取运行锁(被占用时退出 3)。
+
+## `fix-punctuation`
+
+`fix-punctuation --profile <p> [--locale L] [--only <glob>]… [--only-from <file>] [--dry-run] [--json] [--run <id>]`
+
+对应 `check-translation.mjs --cjk-punctuation` 的确定性修复:紧挨中文的 ASCII `, . : ; ! ? ( )` 改成全角 `，。：；！？（）`;括号成对改。不碰围栏代码块(含嵌套在列表里、缩进任意深的)、行内代码、链接目标(括号配对,`a(1).md` 不会被截断)、HTML 标签、裸 URL 与 frontmatter。不需要源文。**不猜**:`.` 只在句末(后面是空白或行尾)才改,其他标点后面必须是空白、行尾、中文或行内代码才改;不满足的原样保留并列在 `unresolved`。适用与 `fix-anchors` 相同的文档类别和哈希规则(`fresh` 记 `doc_rehashed`,`edited`/`untracked` 只写文件)。幂等。
+
+## `triage`
+
+`triage --profile <p> [--locale L] --source-root <dir> [--out-dir <dir>] [--all] [--json]`
+
+只读。对所有已完成译文跑结构校验,把失败的文档按检查器自己的结论分三类:`auto`(`fix-punctuation` 能修)、`retranslate`(标题、表格、围栏代码块数量、链接数量或行内代码数量对不上:译文已经不对应现行源文,脚本补丁就是猜)、`review`(形状相同、内容不同:一处代码块、链接目标或行内代码被改,是有意修改还是错误只有读者能判断)。一篇取它最严重的一类。有文档因找不到源文而没被检查时退出 2。`--out-dir`(不得在翻译根目录内)写 `retranslate.txt`、`review.txt`、`auto.txt`,每行一个文档,可直接给 `requeue --only-from`、`fix-punctuation --only-from` 用。
+
+## `requeue`
+
+`requeue --profile <p> (--triage retranslate[,review] | --only-from <file>) [--reason "<text>"] [--locale L] [--dry-run] [--json] [--run <id>]`
+
+把已完成译文(`fresh`、`edited`)送回待办:快照里的源哈希换成占位值,它们成为 `stale`,下一次运行按"带参考整篇重译"处理,旧译文保留作参考。台账记 `doc_requeued`。`--triage` 现场分诊(不接受 `auto`);已经是 `stale` 等类别的文档跳过并说明。`--dry-run` 只报告。会取运行锁。
 
 ## `next`
 

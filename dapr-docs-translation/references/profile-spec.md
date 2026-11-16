@@ -84,6 +84,10 @@ rules:                                  # 本仓库额外的翻译规则(叠加�
   doNotTranslateSeeds: [ProductName, BrandName]  # 术语表引导时直接进 doNotTranslate 的名称
   links: 相对链接保持原样(站点导入时会统一改写)
   frontmatterTranslatable: [title, description]
+  checks:                                # 可选;默认全部严格。让校验器接受仓库既有译文的惯例
+    fenceComments: translate             # fenced 代码块只有注释文字可译(默认 verbatim:整块逐字节一致)
+    inlinePlaceholders: translate        # 行内代码里的说明性占位符可一对一译成中文(默认 verbatim)
+    localizedUrls: allow                 # 外部链接可增删开头的中文语言段,如 /zh-cn/(默认逐字一致)
   extra:
     - 任意本仓库特有的规则,一条一行
 ```

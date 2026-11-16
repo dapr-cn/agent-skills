@@ -18,7 +18,7 @@ description: 'Read-only verification gate before a translated Dapr docs version 
 
 | 检查 | 命令(在 mono 根运行) |
 | --- | --- |
-| `status-verify` | `node <engine>/scripts/tr.mjs status --profile <zh>/translations/profile.yaml --source-root <zh>/data/source --verify --fail-on stale,failed,blocked,orphan,drift,glossary` |
+| `status-verify` | `node <engine>/scripts/tr.mjs status --profile <zh>/translations/profile.yaml --source-root data/source --verify --fail-on stale,failed,blocked,orphan,drift,glossary` |
 | `zh-data-audit` | `pnpm run zh:data:repair --mode audit --version <v> --repo <zh>` |
 | `docs-verify` | `pnpm run docs:verify --dry-run --version <v> --source-repo <src> --zh-repo <zh>` |
 
@@ -32,6 +32,17 @@ description: 'Read-only verification gate before a translated Dapr docs version 
 - **pass**:以上都没有。只有 pass 时 `canOpenPr` 为 `true`。
 
 `fail` 与 `blocked` 同时出现时结论为 `fail`,两条原因都会列出。
+
+## 闸门没过之后
+
+本技能只读,不修。结构校验失败时,修复用引擎的命令(在译文仓库里写 `translated_content/` 与 `translations/`,不在这里做):
+
+1. `tr.mjs triage --profile … --source-root data/source --out-dir <译文仓库之外>`:把失败分成 `auto`、`retranslate`、`review` 并写清单。
+2. `tr.mjs fix-punctuation …`(与 `fix-anchors`):`auto` 类和锚点由脚本确定性修复。
+3. `tr.mjs requeue --triage retranslate`:结构对不上的译文送回待办,由增量翻译技能重译。
+4. `review` 类由人读后决定:有意的修改就保留,错误就 `requeue --only-from` 重译。
+
+之后重新运行本闸门。
 
 ## 脚本用法
 
