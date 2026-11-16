@@ -88,6 +88,8 @@ export function replayLedger(file) {
     if (e.event === "doc_start") Object.assign(d, { status: "interrupted", attempts: d.attempts + 1 });
     else if (e.event === "doc_done") Object.assign(d, { status: e.status ?? "done", sourceSha256: e.sourceSha256, translationSha256: e.translationSha256, runId: e.run, doneAt: e.ts, flags: e.flags ?? [] });
     else if (e.event === "doc_adopted") Object.assign(d, { status: "done", sourceSha256: e.sourceSha256, translationSha256: e.translationSha256, runId: e.run, doneAt: e.ts, adopted: true });
+    else if (e.event === "doc_rehashed") Object.assign(d, { translationSha256: e.translationSha256 });
+    else if (e.event === "doc_requeued") Object.assign(d, { sourceSha256: e.sourceSha256 });
     else if (e.event === "doc_failed") Object.assign(d, { status: e.status ?? "failed", runId: e.run });
   }
   return { docs, ledgerLines: lines, skippedLines: skipped };
@@ -260,6 +262,54 @@ export function adoptDocs({ dir, run, locale, entries, sourceRevision, glossaryV
     for (const e of adopted) appendLedger(dir, { event: "doc_adopted", run, doc: e.doc, sourceSha256: e.sourceSha256, translationSha256: e.translationSha256 });
   }
   return { adopted: adopted.map((e) => e.doc) };
+}
+
+/**
+ * A translation file of an already recorded document was rewritten by a tool (not by a person): record its new hash so it
+ * stays `fresh` instead of turning `edited`. One snapshot write, one `doc_rehashed` ledger line per document.
+ */
+export function rehashDocs({ dir, run, locale, entries }) {
+  const snapshot = loadSnapshotChain(dir, locale).snapshot;
+  const now = new Date().toISOString();
+  const done = [];
+  for (const e of entries) {
+    const d = snapshot.docs[e.doc];
+    if (!d) continue;
+    d.translationSha256 = e.translationSha256;
+    done.push(e);
+  }
+  if (done.length) {
+    snapshot.updatedAt = now;
+    snapshot.lastRun = run;
+    writeSnapshot(dir, run, `${JSON.stringify(snapshot, null, 2)}\n`);
+    for (const e of done) appendLedger(dir, { event: "doc_rehashed", run, doc: e.doc, translationSha256: e.translationSha256, reason: e.reason ?? "tool rewrite" });
+  }
+  return { rehashed: done.map((e) => e.doc) };
+}
+
+/**
+ * Send finished documents back to the backlog: the recorded source hash becomes a placeholder, so each one is `stale` and the next
+ * run translates it again with the old translation as reference. Nothing else in the record changes. One snapshot write, one
+ * `doc_requeued` ledger line per document.
+ */
+export function requeueDocs({ dir, run, locale, entries, marker, reason }) {
+  const snapshot = loadSnapshotChain(dir, locale).snapshot;
+  const now = new Date().toISOString();
+  const done = [];
+  for (const e of entries) {
+    const d = snapshot.docs[e.doc];
+    if (!d || d.sourceSha256 === marker) continue;
+    d.sourceSha256 = marker;
+    d.note = `requeued: ${reason}`;
+    done.push(e);
+  }
+  if (done.length) {
+    snapshot.updatedAt = now;
+    snapshot.lastRun = run;
+    writeSnapshot(dir, run, `${JSON.stringify(snapshot, null, 2)}\n`);
+    for (const e of done) appendLedger(dir, { event: "doc_requeued", run, doc: e.doc, sourceSha256: marker, reason });
+  }
+  return { requeued: done.map((e) => e.doc) };
 }
 
 /** A document that did not pass: bump attempts, record `failed` (or `blocked` at 3 attempts), keep the draft where it is. */

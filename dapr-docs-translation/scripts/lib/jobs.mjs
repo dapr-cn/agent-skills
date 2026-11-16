@@ -83,6 +83,9 @@ export function buildJob({ ctx, locale, analysis, d, jobDir, runId, trPath, glos
   const checkArgs = [`--translatable ${(profile.rules?.frontmatterTranslatable ?? ["title", "description"]).join(",")}`];
   if (glossary) checkArgs.push(`--glossary ${analysis.glossary.file}`);
   if (loc.cjk) checkArgs.push("--min-cjk-ratio 0.2 --cjk-punctuation");
+  if (profile.rules?.checks?.fenceComments === "translate") checkArgs.push("--fence-comments translate");
+  if (profile.rules?.checks?.inlinePlaceholders === "translate") checkArgs.push("--inline-placeholders translate");
+  if (profile.rules?.checks?.localizedUrls === "allow") checkArgs.push("--localized-urls allow");
 
   const job = {
     schema: 1, run: runId ?? null, profile: ctx.profileFile, repo: ctx.repo, state: analysis.paths.state, glossaryFile: glossary ? analysis.glossary.file : null, locale, localeName: loc.name ?? locale, localeNotes: loc.notes ?? "", cjk: Boolean(loc.cjk),
@@ -95,7 +98,7 @@ export function buildJob({ ctx, locale, analysis, d, jobDir, runId, trPath, glos
     glossary: { version: analysis.glossary.version, pending: pendingIn(sourceText, analysis.glossary.pending).map((e) => ({ source: e.source, target: e.target, kind: e.kind, seenIn: e.docs.length })), terms: found.terms.map(({ id, source, target, alt, note, locked }) => ({ id, source, target, alt, note, locked })), doNotTranslate: found.doNotTranslate.map(({ term, note }) => ({ term, note })) },
     termTargets: termTargetsOf(found.terms),
     style: styleText ?? "",
-    rules: { frontmatterTranslatable: profile.rules?.frontmatterTranslatable ?? ["title", "description"], links: profile.rules?.links ?? "", extra: profile.rules?.extra ?? [], doNotTranslateSeeds: profile.rules?.doNotTranslateSeeds ?? [] },
+    rules: { frontmatterTranslatable: profile.rules?.frontmatterTranslatable ?? ["title", "description"], checks: profile.rules?.checks ?? {}, links: profile.rules?.links ?? "", extra: profile.rules?.extra ?? [], doNotTranslateSeeds: profile.rules?.doNotTranslateSeeds ?? [] },
     models: profile.models ?? {},
     commands: {
       check: `node ${trPath} check --job ${path.join(jobDir, "job.json")}`,
@@ -112,6 +115,9 @@ export function buildJob({ ctx, locale, analysis, d, jobDir, runId, trPath, glos
       chunks ? "Translate chunks/NNN.src.md in order into chunks/NNN.out.md (one file per chunk, same structure), then run commands.assemble: it joins them into output.draft and checks it." : `Write the translation to output.draft (UTF-8, no BOM, LF, one trailing newline).`,
       "Use glossary.terms[].target for every listed term and keep glossary.doNotTranslate names as they are. glossary.pending lists renderings chosen in other documents that are not confirmed yet: reuse them when they fit, so the glossary converges. Follow rules, localeNotes and style (see references/translation-procedure.md §3).",
       `Run commands.check; fix the draft from its report, at most 2 rounds. Then write output.result as JSON: {"doc","ok","model","retries","seconds","flags":[],"termCandidates":[{"source","target","note","doNotTranslate"}]} and reply with that JSON only. termCandidates: only product-specific terms and names that occur in the document and that you rendered in the translation, not in glossary.terms; no file names, flags, identifiers, titles or ordinary words (they are filtered out anyway).`,
+      ...(profile.rules?.checks?.fenceComments === "translate" ? ["Fenced code: translate comment text only; the code before a comment marker, strings, keys and identifiers stay byte for byte."] : []),
+      ...(profile.rules?.checks?.inlinePlaceholders === "translate" ? ["Inline code: identifiers, commands, flags and keys stay as they are; a prose placeholder such as `[HOST NAME]` may be translated, one span for one span."] : []),
+      ...(profile.rules?.checks?.localizedUrls === "allow" ? ["Links: external URLs stay as they are; where the target site has a Chinese edition you may add its locale segment (/zh-cn/), but never change anything else in the URL."] : []),
       "You do not write state, the glossary or the ledger, and you touch nothing outside output.draft, chunks/ and output.result.",
     ],
   };

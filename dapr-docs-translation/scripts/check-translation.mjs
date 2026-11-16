@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // check-translation — structural checks for a translated Markdown/MDX document. Node built-ins only;
-// `github-slugger` is used for anchor checks when it resolves from the current directory.
+// Same-document anchors are checked with a built-in github-slugger equivalent.
 //
 //   check-translation.mjs <source.md> <translation.md>
 //       [--translatable title,description]   frontmatter keys whose values may differ (default: title,description)
@@ -9,12 +9,17 @@
 //       [--min-cjk-ratio 0.2]                soft check; use for Chinese/Japanese/Korean targets only
 //       [--cjk-punctuation]                  hard check: no ASCII , . : ; ! ? ( ) right next to CJK text, or between an inline
 //                                            code span and following CJK text (full-width expected)
+//       [--fence-comments translate]         fenced code: a line may differ from the source in its comment text only
+//                                            (code before the comment marker and the line count stay identical); default: verbatim
+//       [--inline-placeholders translate]    inline code: a span may be replaced one-for-one by a span containing CJK
+//                                            (prose placeholders such as `[HOST NAME]`); default: verbatim
+//       [--localized-urls allow]             links: an external URL may gain or lose a leading zh locale path segment
+//                                            (learn.microsoft.com/dotnet/x vs learn.microsoft.com/zh-cn/dotnet/x); default: exact
 //
 // Prints JSON {ok, hard:[{check,message}], soft:[{check,message}]}.
 // Exit codes: 0 no hard failure, 1 hard failure, 2 usage / unreadable file.
 import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import path from "node:path";
+import { decodeFragment, headingList, slugList } from "./lib/anchors.mjs";
 
 const args = process.argv.slice(2);
 const files = [];
@@ -120,7 +125,9 @@ function fences(lines) {
 
 function inlineCode(text) {
   const spans = [];
-  const rest = text.replace(/(`+)(?!`)([\s\S]*?[^`])\1(?!`)/g, (_, ticks, content) => {
+  // a code span lives inside one paragraph (CommonMark): it never pairs a stray backtick with one past a blank line, which would
+  // swallow the headings, tables and links in between
+  const rest = text.replace(/(`+)(?!`)((?:(?!\n[ \t]*\n)[\s\S])*?[^`])\1(?!`)/g, (_, ticks, content) => {
     spans.push(content);
     return "\u0000CODE\u0000";
   });
@@ -168,9 +175,56 @@ else {
   });
 }
 
-// ---- fenced code: count and verbatim content ----
+// ---- fenced code: count and verbatim content (comment text may be translated under --fence-comments translate) ----
+// Comment markers recognised on a line: // # -- ; % /* * */ <!--. The part of the line before the marker must match exactly.
+const COMMENT_ONLY = /^\s*(?:\/\/|#|--|;|%|\/\*|\*\/|\*(?:\s|$)|<!--|REM\s)/;
+const TRAILING_COMMENT = /(?:^|\s)(?:\/\/|#|--|\/\*|<!--)(?:\s|$|[^\s/])/;
+function codeOfLine(line, state) {
+  if (state.block) {
+    if (line.includes("*/")) state.block = false;
+    return null; // inside a block comment: all comment
+  }
+  if (COMMENT_ONLY.test(line)) {
+    if (/^\s*\/\*/.test(line) && !line.includes("*/")) state.block = true;
+    return "";
+  }
+  const m = TRAILING_COMMENT.exec(line);
+  if (m) {
+    const at = m.index + (m[0].startsWith(" ") || m[0].startsWith("\t") ? 1 : 0);
+    // a `//` right after a colon is a URL scheme, not a comment
+    if (line[at - 1] === ":" ) return line;
+    if (/\/\*/.test(line.slice(at, at + 2)) && !line.includes("*/", at)) state.block = true;
+    return line.slice(0, at).trimEnd();
+  }
+  return line;
+}
+// Under --fence-comments translate a block matches when its code lines (comments and blank lines dropped, trailing
+// whitespace ignored) are identical and the fence lines agree; comment text and comment-only lines may change freely.
+function sameCodeIgnoringComments(x, y) {
+  const codeLines = (block) => {
+    const lines = block.split("\n");
+    const state = { block: false };
+    const kept = [lines[0].trimEnd(), lines.at(-1).trimEnd()];
+    const body = [];
+    for (const line of lines.slice(1, -1)) {
+      const code = codeOfLine(line, state);
+      if (code === null || code.trim() === "") continue;
+      body.push(code.trimEnd());
+    }
+    return [kept[0], ...body, kept[1]];
+  };
+  const cx = codeLines(x);
+  const cy = codeLines(y);
+  return cx.length === cy.length && cx.every((line, i) => line === cy[i]);
+}
 if (a.code.length !== b.code.length) fail("code-fence", `fenced block count ${a.code.length} vs ${b.code.length}`);
-else a.code.forEach((block, i) => block !== b.code[i] && fail("code-fence", `fenced block #${i + 1} differs from the source`));
+else {
+  a.code.forEach((block, i) => {
+    if (block === b.code[i]) return;
+    if (opt["fence-comments"] === "translate" && sameCodeIgnoringComments(block, b.code[i])) return;
+    fail("code-fence", `fenced block #${i + 1} differs from the source${opt["fence-comments"] === "translate" ? " beyond comment text" : ""}`);
+  });
+}
 
 // ---- inline code multiset ----
 const sorted = (xs) => [...xs].sort();
@@ -178,8 +232,19 @@ if (sorted(a.spans).join("\u0001") !== sorted(b.spans).join("\u0001")) {
   const count = (xs) => xs.reduce((m, x) => m.set(x, (m.get(x) ?? 0) + 1), new Map());
   const ca = count(a.spans);
   const cb = count(b.spans);
-  const diff = [...new Set([...ca.keys(), ...cb.keys()])].filter((k) => ca.get(k) !== cb.get(k)).slice(0, 5);
-  fail("inline-code", `inline code spans differ (${a.spans.length} vs ${b.spans.length}); e.g. ${diff.map((d) => JSON.stringify(d)).join(", ")}`);
+  // spans present on one side only (multiset difference)
+  const onlySrc = [];
+  const onlyDst = [];
+  for (const k of new Set([...ca.keys(), ...cb.keys()])) {
+    const d = (ca.get(k) ?? 0) - (cb.get(k) ?? 0);
+    for (let n = 0; n < Math.abs(d); n += 1) (d > 0 ? onlySrc : onlyDst).push(k);
+  }
+  const CJK_SPAN = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/;
+  const placeholdersOk = opt["inline-placeholders"] === "translate" && onlySrc.length === onlyDst.length && onlyDst.every((x) => CJK_SPAN.test(x));
+  if (!placeholdersOk) {
+    const diff = [...new Set([...ca.keys(), ...cb.keys()])].filter((k) => ca.get(k) !== cb.get(k)).slice(0, 5);
+    fail("inline-code", `inline code spans differ (${a.spans.length} vs ${b.spans.length}); e.g. ${diff.map((d) => JSON.stringify(d)).join(", ")}`);
+  }
 }
 
 // ---- headings ----
@@ -194,35 +259,30 @@ if (tb(a.tables) !== tb(b.tables)) fail("tables", `table shapes differ: [${tb(a.
 if (sorted(a.tags).join(",") !== sorted(b.tags).join(",")) fail("html", "HTML tag multiset differs");
 
 // ---- links: same sequence; same-document fragments may change but must resolve ----
-const norm = (t) => (t.startsWith("#") ? "#" : t);
+// a trailing slash on an external URL (https://example.org vs https://example.org/) names the same target
+// --localized-urls allow: a leading zh locale segment (/zh-cn/, /zh-hans/, /zh/ ...) right after the host names the same page
+const LOCALE_SEGMENT = /^(https?:\/\/[^/]+)\/zh(?:-(?:cn|hans|tw|hant|hk))?(?=\/|$|#|\?)/i;
+const norm = (t) => {
+  if (t.startsWith("#")) return "#";
+  if (!/^https?:\/\//.test(t)) return t;
+  const u = opt["localized-urls"] === "allow" ? t.replace(LOCALE_SEGMENT, "$1") : t;
+  return u.replace(/\/(?=$|#|\?)/, "");
+};
 if (a.links.map(norm).join("\n") !== b.links.map(norm).join("\n")) {
   const first = a.links.findIndex((t, i) => norm(t) !== norm(b.links[i] ?? ""));
   fail("links", `link/image targets differ (${a.links.length} vs ${b.links.length}); first difference at #${first + 1}: ${JSON.stringify(a.links[first])} vs ${JSON.stringify(b.links[first])}`);
 }
 
 // ---- anchors ----
-let Slugger;
-for (const base of [process.cwd(), path.dirname(path.resolve(files[1])), path.dirname(path.resolve(files[0]))]) {
-  try {
-    Slugger = (await import(createRequire(path.join(base, "noop.js")).resolve("github-slugger"))).default;
-    break;
-  } catch {
-    // try the next location
-  }
-}
-if (!Slugger) warn("anchor-check-skipped", "github-slugger could not be resolved from the working directory or the file locations; same-document anchors were not verified");
-if (Slugger) {
-  const slugs = (headings) => {
-    const s = new Slugger();
-    return new Set(headings.map((h) => s.slug(h.text.replace(/[*_`]|<[^>]+>|\[([^\]]*)\]\([^)]*\)/g, "$1"))));
-  };
-  const sa = slugs(a.headings);
-  const sb = slugs(b.headings);
+// Heading slugs come from lib/anchors.mjs (a dependency-free github-slugger equivalent).
+{
+  const sa = new Set(slugList(headingList(src.text)));
+  const sb = new Set(slugList(headingList(dst.text)));
   a.links.forEach((target, i) => {
     const t = b.links[i];
     if (!target?.startsWith("#") || !t?.startsWith("#")) return;
-    const wasOk = sa.has(decodeURIComponent(target.slice(1)).toLowerCase()) || sa.has(target.slice(1));
-    const isOk = sb.has(decodeURIComponent(t.slice(1)).toLowerCase()) || sb.has(t.slice(1));
+    const wasOk = sa.has(decodeFragment(target.slice(1)).toLowerCase()) || sa.has(target.slice(1));
+    const isOk = sb.has(decodeFragment(t.slice(1)).toLowerCase()) || sb.has(t.slice(1));
     if (wasOk && !isOk) fail("anchors", `${t} does not resolve to a translated heading (source ${target} did)`);
   });
 }

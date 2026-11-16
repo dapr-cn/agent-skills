@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { node, tmpDir, write } from "./helpers.mjs";
 
@@ -60,12 +59,6 @@ echo "hello" # keep
 const dir = tmpDir();
 const source = write(path.join(dir, "en.md"), en);
 const good = write(path.join(dir, "zh.md"), zh);
-let hasSlugger = true;
-try {
-  createRequire(path.join(process.cwd(), "noop.js")).resolve("github-slugger");
-} catch {
-  hasSlugger = false;
-}
 const verdict = (translation, ...extra) => {
   const r = node("check-translation.mjs", [source, translation, ...extra]);
   return { status: r.status, out: JSON.parse(r.stdout || "{}") };
@@ -96,9 +89,16 @@ for (const [name, from, to, check] of mutations) {
   });
 }
 
-test("rejects: broken same-document anchor", { skip: !hasSlugger && "github-slugger is not resolvable from the working directory" }, () => {
+test("rejects: broken same-document anchor (built-in slugger, no dependency)", () => {
   const m = verdict(variant("anchor", zh.replace("(#设置)", "(#setup)")));
   assert.ok(m.out.hard.some((h) => h.check === "anchors"));
+  assert.ok(!(m.out.soft ?? []).some((x) => x.check === "anchor-check-skipped"));
+});
+
+test("anchors: duplicate headings get -1 suffixes, punctuation is dropped", () => {
+  const a = write(path.join(dir, "dup.en.md"), "# A\n\n## Setup\n\n## Setup\n\n## What's new?\n\n[x](#setup-1) [y](#whats-new)\n");
+  const b = write(path.join(dir, "dup.zh.md"), "# A\n\n## Setup\n\n## Setup\n\n## What's new?\n\n[x](#setup-1) [y](#whats-new)\n");
+  assert.equal(node("check-translation.mjs", [a, b]).status, 0);
 });
 
 test("rejects CRLF; a changed number is only a soft flag", () => {
@@ -156,4 +156,73 @@ test("MDX with imports and JSX components passes", () => {
 test("usage errors exit 2", () => {
   assert.equal(node("check-translation.mjs", [source]).status, 2);
   assert.equal(node("check-translation.mjs", [source, path.join(dir, "missing.md")]).status, 2);
+});
+
+// ---- tolerances taken from the baseline translation convention (profile rules.checks) ----
+const code = (body) => `# Code\n\n\`\`\`yaml\n${body}\n\`\`\`\n`;
+const codeEn = write(path.join(dir, "code.en.md"), code("spec:\n  # Connection string\n  host: localhost # the host\n  port: 80\n"));
+const codeCheck = (body, ...extra) => {
+  const r = node("check-translation.mjs", [codeEn, write(path.join(dir, `code-${Math.abs(hash(body))}.md`), code(body)), ...extra]);
+  return { status: r.status, out: JSON.parse(r.stdout || "{}") };
+};
+const hash = (x) => [...x].reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 7);
+
+test("--fence-comments translate: comment text may change, code may not", () => {
+  const translated = "spec:\n  # 连接字符串\n  host: localhost # 主机\n  port: 80\n";
+  assert.equal(codeCheck(translated).status, 1, "verbatim by default");
+  assert.equal(codeCheck(translated, "--fence-comments", "translate").status, 0);
+  const reducedComments = "spec:\n  host: localhost\n  port: 80\n";
+  assert.equal(codeCheck(reducedComments, "--fence-comments", "translate").status, 0, "a dropped comment line is harmless");
+  const codeChanged = "spec:\n  # 连接字符串\n  host: example.org # 主机\n  port: 80\n";
+  const r = codeCheck(codeChanged, "--fence-comments", "translate");
+  assert.equal(r.status, 1);
+  assert.match(r.out.hard[0].message, /beyond comment text/);
+});
+
+test("--fence-comments translate: URLs with // are code, block comments are comments", () => {
+  const a = write(path.join(dir, "u.en.md"), code("url: https://example.org\n/* note\n   more */\nx = 1"));
+  const ok = write(path.join(dir, "u.zh.md"), code("url: https://example.org\n/* 说明\n   更多 */\nx = 1"));
+  const bad = write(path.join(dir, "u2.zh.md"), code("url: https://example.com\n/* 说明\n   更多 */\nx = 1"));
+  assert.equal(node("check-translation.mjs", [a, ok, "--fence-comments", "translate"]).status, 0);
+  assert.equal(node("check-translation.mjs", [a, bad, "--fence-comments", "translate"]).status, 1);
+});
+
+test("--localized-urls allow: a leading zh locale segment is the same target, other changes are not", () => {
+  const src = (u) => `# T\n\nSee [docs](${u}).\n`;
+  const e = write(path.join(dir, "l.en.md"), src("https://learn.microsoft.com/dotnet/csharp/x#c-12"));
+  const zh = write(path.join(dir, "l.zh.md"), src("https://learn.microsoft.com/zh-cn/dotnet/csharp/x#c-12"));
+  const other = write(path.join(dir, "l2.zh.md"), src("https://learn.microsoft.com/zh-cn/dotnet/csharp/y#c-12"));
+  const fr = write(path.join(dir, "l3.zh.md"), src("https://learn.microsoft.com/fr-fr/dotnet/csharp/x#c-12"));
+  assert.equal(node("check-translation.mjs", [e, zh]).status, 1, "exact by default");
+  assert.equal(node("check-translation.mjs", [e, zh, "--localized-urls", "allow"]).status, 0);
+  assert.equal(node("check-translation.mjs", [e, other, "--localized-urls", "allow"]).status, 1, "a different path still fails");
+  assert.equal(node("check-translation.mjs", [e, fr, "--localized-urls", "allow"]).status, 1, "only zh locales are accepted");
+});
+
+const inl = (t) => `# T\n\nSet ${t} here.\n`;
+test("--inline-placeholders translate: one-for-one CJK replacement only", () => {
+  const e = write(path.join(dir, "i.en.md"), inl("`[HOST NAME]:6379`"));
+  const swapped = write(path.join(dir, "i.zh.md"), inl("`[主机名]:6379`"));
+  const dropped = write(path.join(dir, "i2.zh.md"), inl("[主机名]:6379"));
+  const latin = write(path.join(dir, "i3.zh.md"), inl("`[OTHER NAME]:6379`"));
+  assert.equal(node("check-translation.mjs", [e, swapped]).status, 1, "strict by default");
+  assert.equal(node("check-translation.mjs", [e, swapped, "--inline-placeholders", "translate"]).status, 0);
+  assert.equal(node("check-translation.mjs", [e, dropped, "--inline-placeholders", "translate"]).status, 1, "a lost span still fails");
+  assert.equal(node("check-translation.mjs", [e, latin, "--inline-placeholders", "translate"]).status, 1, "a Latin replacement still fails");
+});
+
+test("a trailing slash on an external URL is the same link", () => {
+  const e = write(path.join(dir, "l.en.md"), "# T\n\nSee [z](https://zipkin.io) and [d](https://a.io/x/).\n");
+  const z = write(path.join(dir, "l.zh.md"), "# T\n\n参见 [z](https://zipkin.io/) 与 [d](https://a.io/x/)。\n");
+  assert.equal(node("check-translation.mjs", [e, z]).status, 0);
+  const other = write(path.join(dir, "l2.zh.md"), "# T\n\n参见 [z](https://zipkin.io/) 与 [d](https://a.io/y/)。\n");
+  assert.equal(node("check-translation.mjs", [e, other]).status, 1);
+});
+
+test("a stray backtick does not swallow the headings after it", () => {
+  const en = write(path.join(dir, "s.en.md"), "# T\n\nUse the ` character.\n\n## One\n\nText.\n\n## Two\n\nSee `x` here.\n");
+  const dropped = write(path.join(dir, "s.zh.md"), "# T\n\n使用 ` 字符。\n\n## 一\n\n文字。\n\n见 `x`。\n");
+  const r = node("check-translation.mjs", [en, dropped]);
+  assert.equal(r.status, 1, "a missing heading is found even though a stray backtick comes before it");
+  assert.equal(JSON.parse(r.stdout).hard.some((h) => h.check === "headings"), true);
 });

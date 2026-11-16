@@ -726,6 +726,12 @@ test("output.template: translations live in the site tree; adopt, scan, next and
   assert.equal(existsSync(site.content("zh-CN", "a.md")), false, "nothing is written to the default location");
   assert.equal(trJson("scan", "--profile", site.profile).json.summary.fresh, 2);
   assert.equal(trJson("status", "--profile", site.profile, "--verify", "--source-root", "docs").json.verify.checked, 2);
+
+  // a --source-root that points nowhere skips every document: that is a failed gate, never a pass
+  const lost = trJson("status", "--profile", site.profile, "--verify", "--source-root", "no/such/dir");
+  assert.equal(lost.json.verify.checked, 0);
+  assert.equal(lost.status, 1, "skipped documents fail the gate");
+  assert.ok(lost.json.gates.some((g) => /were not checked/.test(g)), JSON.stringify(lost.json.gates));
 });
 
 test("status --verify: passes clean translations and fails when a finished one is damaged", () => {

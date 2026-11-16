@@ -4,7 +4,11 @@
 //   init     scaffold <repo>/<translations-root>/ (never overwrites)
 //   scan     read-only: discover, classify every document, pick the next batch        [--locale L|all]
 //   status   read-only: completeness, per-group breakdown, usage by model, CI gates   [--locale L|all]
-//   adopt    record existing translations as the baseline (untracked → fresh)
+//   adopt    record existing translations as the baseline (untracked → fresh; --as-stale: → stale, retranslated with the old text as reference)
+//   fix-anchors  retarget same-document #fragment links of finished translations to the translated headings  [--only G] [--dry-run]
+//   fix-punctuation  ASCII punctuation next to CJK text → full-width, outside code, links and tags  [--only G] [--dry-run]
+//   triage   read-only: sort the structural-check failures into auto / retranslate / review   [--out-dir D] [--all] [--json]
+//   requeue  send finished translations back to the backlog as stale   --triage retranslate[,review] | --only-from F  [--dry-run]
 //   next     write one self-contained job per picked document for subagents   [--chunk-bytes N: chunk size, default 6144]
 //   check    structural check of a job's draft          assemble  join chunk outputs into the draft + check
 //   finalize accept a checked draft and record it       fail      record a failed attempt (blocked at 3)
@@ -20,11 +24,14 @@ import { alignSlots, buildBootstrap, extractSlots, matchEvidence, normalisePair,
 import { DEFAULT_PROMOTE_AFTER, applyAudit, auditGlossary, docTitleOf, emptyGlossary, emptyPending, mergeCandidates } from "./lib/glossary.mjs";
 import { buildJob, jobSlug, termsIn, termTargetsOf } from "./lib/jobs.mjs";
 import { joinChunks } from "./lib/chunk.mjs";
-import { acquireLock, adoptDocs, appendLedger, failDoc, finalizeDoc, readJson, recordGlossary, releaseLock, sha256File } from "./lib/state.mjs";
+import { acquireLock, adoptDocs, appendLedger, failDoc, finalizeDoc, readJson, recordGlossary, rehashDocs, releaseLock, requeueDocs, sha256File } from "./lib/state.mjs";
+import { fixAnchors } from "./lib/anchors.mjs";
+import { fixPunctuation } from "./lib/punctuation.mjs";
+import { TRIAGE_CLASSES, triage } from "./lib/triage.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const trPath = path.join(here, "tr.mjs");
-const BOOLEAN = new Set(["json", "verify", "dry-run", "no-exec", "if-translation-newer", "no-glossary", "apply", "merge", "static-only", "no-hints"]);
+const BOOLEAN = new Set(["json", "verify", "dry-run", "no-exec", "if-translation-newer", "no-glossary", "apply", "merge", "static-only", "no-hints", "as-stale", "all"]);
 const REPEATABLE = new Set(["locale-list", "glob", "exclude", "only", "doc"]);
 
 const argv = process.argv.slice(2);
@@ -226,6 +233,10 @@ function checkerArgs(job) {
   const args = ["--translatable", (job.rules?.frontmatterTranslatable ?? ["title", "description"]).join(",")];
   if (job.glossaryFile && existsSync(job.glossaryFile)) args.push("--glossary", job.glossaryFile);
   if (job.cjk) args.push("--min-cjk-ratio", "0.2", "--cjk-punctuation");
+  // profile rules.checks: opt-in tolerances that follow the repository's translation convention
+  if (job.rules?.checks?.fenceComments === "translate") args.push("--fence-comments", "translate");
+  if (job.rules?.checks?.inlinePlaceholders === "translate") args.push("--inline-placeholders", "translate");
+  if (job.rules?.checks?.localizedUrls === "allow") args.push("--localized-urls", "allow");
   return args;
 }
 
@@ -274,6 +285,8 @@ function statusResult(run) {
     if (summary.counts[c] > 0) gates.push(`${summary.counts[c]} document(s) are ${c}`);
   }
   if (verify?.hard.length) gates.push(`${verify.hard.length} finished translation(s) fail the structural checks`);
+  // a verify that skipped documents proved nothing about them: never let that read as a pass
+  if (verify?.skipped.length) gates.push(`${verify.skipped.length} finished translation(s) were not checked: source file location unknown (pass a --source-root relative to the repository, or use sources.glob)`);
   const result = {
     schema: 1, generatedAt: new Date().toISOString(), locale: run.locale, snapshotSource: analysis.snapshotSource,
     sourceRevision: analysis.sourceRevision, recordedSourceRevision: analysis.snapshot.sourceRevision ?? null,
@@ -342,10 +355,14 @@ function gitTime(file) {
   return statSync(file).mtimeMs / 1000;
 }
 
+const STALE_ADOPTION = "unknown:adopted-as-stale";
+
 function adopt() {
   const run = single();
   const { ctx, locale, analysis } = run;
-  const only = opt.only ? globMatcher(opt.only) : () => true;
+  const listed = opt["only-from"] ? new Set(readFileSync(path.resolve(runDir(), opt["only-from"]), "utf8").split("\n").map((x) => x.trim()).filter(Boolean)) : null;
+  const byGlob = opt.only ? globMatcher(opt.only) : () => true;
+  const only = (doc) => byGlob(doc) && (!listed || listed.has(doc));
   const candidates = Object.values(analysis.docs).filter((d) => d.class === "untracked" && only(d.doc));
   const adopt = [];
   const skipped = [];
@@ -362,12 +379,13 @@ function adopt() {
         continue;
       }
     }
-    adopt.push({ doc: d.doc, sourceSha256: d.sourceSha256, translationSha256: sha256File(d.translationPath), translationPath: path.relative(ctx.repo, d.translationPath).split(path.sep).join("/") });
+    // --as-stale: keep the translation as a reference but record it against no known source, so the document is `stale` and gets retranslated
+    adopt.push({ doc: d.doc, sourceSha256: opt["as-stale"] ? STALE_ADOPTION : d.sourceSha256, translationSha256: sha256File(d.translationPath), translationPath: path.relative(ctx.repo, d.translationPath).split(path.sep).join("/") });
   }
   const report = { locale, candidates: candidates.length, adopt: adopt.map((e) => e.doc), skipped, dryRun: Boolean(opt["dry-run"]) };
   if (!opt["dry-run"] && adopt.length) {
     const runId = opt.run ?? `adopt-${defaultRun()}`;
-    withLock(analysis.paths.state, runId, () => adoptDocs({ dir: analysis.paths.state, run: runId, locale, entries: adopt, sourceRevision: analysis.sourceRevision, glossaryVersion: analysis.glossary.version, glossarySha256: analysis.glossary.sha256 }));
+    withLock(analysis.paths.state, runId, () => adoptDocs({ dir: analysis.paths.state, run: runId, locale, entries: adopt, sourceRevision: analysis.sourceRevision, glossaryVersion: analysis.glossary.version, glossarySha256: analysis.glossary.sha256, note: opt["as-stale"] ? "adopted as stale: the translation predates the current source; kept as a reference for retranslation" : undefined }));
     report.run = runId;
   }
   if (opt.json) return void console.log(JSON.stringify(report, null, 2));
@@ -376,6 +394,140 @@ function adopt() {
   if (adopt.length > 50) console.log(`  … ${adopt.length - 50} more`);
   for (const s of skipped.slice(0, 50)) console.log(`  - ${s.doc}  (${s.reason})`);
   if (!adopt.length && !candidates.length) console.log("nothing untracked: every translation file already has a record");
+}
+
+/**
+ * fix-anchors: a translated heading gets a new slug, so `[x](#english-slug)` no longer resolves. For every translation whose
+ * source has not changed (fresh, edited, untracked) and whose headings match the source one to one, retarget those links to the
+ * translated heading at the same position. Only same-document `#fragment` links change. Recorded documents stay `fresh`:
+ * their new hash goes into the snapshot and the ledger (`doc_rehashed`); hand-edited and untracked files are written but not rehashed.
+ */
+/**
+ * Rewrite finished translations with a deterministic fixer. Works on documents whose source did not change (fresh, edited,
+ * untracked); a `fresh` document gets its new hash recorded so it stays fresh, the others are only written.
+ * fixer(sourceText | null, translationText) → { text, fixes, unresolved, skipped? }
+ */
+function rewriteTranslations({ label, unit, fixer, needsSource, runPrefix }) {
+  const run = single();
+  const { ctx, locale, analysis } = run;
+  const only = opt.only ? globMatcher(opt.only) : () => true;
+  const listed = opt["only-from"] ? new Set(readFileSync(path.resolve(runDir(), opt["only-from"]), "utf8").split("\n").map((x) => x.trim()).filter(Boolean)) : null;
+  const report = { locale, dryRun: Boolean(opt["dry-run"]), changed: [], clean: 0, skipped: [], unresolved: [] };
+  const rehash = [];
+  for (const d of Object.values(analysis.docs).filter((x) => x.translationExists && only(x.doc) && (!listed || listed.has(x.doc)))) {
+    if (!["fresh", "edited", "untracked"].includes(d.class)) {
+      report.skipped.push({ doc: d.doc, reason: `class ${d.class}: the source changed or the document is not translated yet` });
+      continue;
+    }
+    if (needsSource && (!d.abs || !existsSync(d.abs))) {
+      report.skipped.push({ doc: d.doc, reason: "source file location unknown (pass --source-root)" });
+      continue;
+    }
+    const before = readFileSync(d.translationPath, "utf8");
+    const r = fixer(needsSource ? readFileSync(d.abs, "utf8") : null, before);
+    if (r.skipped) {
+      report.skipped.push({ doc: d.doc, reason: r.skipped });
+      continue;
+    }
+    for (const u of r.unresolved) report.unresolved.push({ doc: d.doc, ...u });
+    if (!r.fixes.length) {
+      report.clean += 1;
+      continue;
+    }
+    report.changed.push({ doc: d.doc, class: d.class, fixes: r.fixes });
+    if (opt["dry-run"]) continue;
+    writeAtomic(d.translationPath, r.text);
+    if (d.class === "fresh") rehash.push({ doc: d.doc, translationSha256: sha256File(d.translationPath), reason: label });
+  }
+  if (rehash.length) {
+    const runId = opt.run ?? `${runPrefix}-${defaultRun()}`;
+    withLock(analysis.paths.state, runId, () => rehashDocs({ dir: analysis.paths.state, run: runId, locale, entries: rehash }));
+    report.run = runId;
+  }
+  if (opt.json) return void console.log(JSON.stringify(report, null, 2));
+  const total = report.changed.reduce((n, c) => n + c.fixes.length, 0);
+  console.log(`${opt["dry-run"] ? "would fix" : "fixed"} ${total} ${unit} in ${report.changed.length} document(s) for ${locale}; ${report.clean} need nothing`);
+  for (const c of report.changed.slice(0, 50)) console.log(`  ~ ${c.doc}  (${c.fixes.length}${c.class === "fresh" ? "" : `, ${c.class}: state hash not updated`})`);
+  if (report.changed.length > 50) console.log(`  … ${report.changed.length - 50} more`);
+  for (const s of report.skipped.slice(0, 30)) console.log(`  - ${s.doc}  (${s.reason})`);
+  if (report.skipped.length > 30) console.log(`  … ${report.skipped.length - 30} more skipped`);
+  return report;
+}
+
+function fixAnchorsCmd() {
+  const report = rewriteTranslations({ label: "fix-anchors", unit: "anchor link(s)", fixer: fixAnchors, needsSource: true, runPrefix: "fix-anchors" });
+  if (report?.unresolved.length) console.log(`${report.unresolved.length} link(s) name no heading of the source either; left unchanged (first: ${report.unresolved[0].doc}:${report.unresolved[0].line} #${report.unresolved[0].fragment})`);
+}
+
+function fixPunctuationCmd() {
+  const report = rewriteTranslations({ label: "fix-punctuation", unit: "punctuation mark(s)", fixer: (_src, text) => fixPunctuation(text), needsSource: false, runPrefix: "fix-punct" });
+  if (report?.unresolved.length) console.log(`${report.unresolved.length} mark(s) could not be converted without guessing; left unchanged (first: ${report.unresolved[0].doc}:${report.unresolved[0].line} "${report.unresolved[0].context}")`);
+}
+
+// ------------------------------------------------------------------------------------------------ triage / requeue
+
+function triageResult(run) {
+  const verify = verifyAll(run);
+  const docs = triage(verify.hard);
+  const by = Object.fromEntries(TRIAGE_CLASSES.map((c) => [c, docs.filter((d) => d.class === c)]));
+  return { verify, docs, by };
+}
+
+function triageCmd() {
+  const run = single();
+  const { verify, docs, by } = triageResult(run);
+  if (verify.skipped.length) fail(`${verify.skipped.length} finished translation(s) could not be checked (source file location unknown): pass --source-root`);
+  if (opt["out-dir"]) {
+    const dir = path.resolve(runDir(), opt["out-dir"]);
+    if (isInside(dir, run.ctx.translationsRoot)) fail(`--out-dir ${dir} is inside the translations root; use the session scratchpad`);
+    mkdirSync(dir, { recursive: true });
+    for (const c of TRIAGE_CLASSES) writeAtomic(path.join(dir, `${c}.txt`), by[c].map((d) => d.doc).join("\n") + (by[c].length ? "\n" : ""));
+  }
+  if (opt.json) return void console.log(JSON.stringify({ locale: run.locale, checked: verify.checked, failing: docs.length, counts: Object.fromEntries(TRIAGE_CLASSES.map((c) => [c, by[c].length])), docs }, null, 2));
+  console.log(`${run.locale}: ${verify.checked} translation(s) checked, ${docs.length} fail the structural checks`);
+  const advice = { auto: "fix-punctuation repairs these", retranslate: "structure no longer matches the source: requeue --triage retranslate", review: "same shape, different content: read before deciding" };
+  for (const c of TRIAGE_CLASSES) {
+    console.log(`\n${c}: ${by[c].length}  (${advice[c]})`);
+    for (const d of by[c].slice(0, opt.all ? Infinity : 15)) console.log(`  ${d.doc}  — ${d.reasons.map((r) => r.why).join("; ")}`);
+    if (!opt.all && by[c].length > 15) console.log(`  … ${by[c].length - 15} more (--all, --json, or --out-dir)`);
+  }
+  if (opt["out-dir"]) console.log(`\nlists written to ${path.resolve(runDir(), opt["out-dir"])}/{${TRIAGE_CLASSES.join(",")}}.txt`);
+}
+
+const REQUEUED = "unknown:requeued";
+
+function requeueCmd() {
+  const run = single();
+  const { ctx, locale, analysis } = run;
+  let names;
+  if (opt["only-from"]) names = new Set(readFileSync(path.resolve(runDir(), opt["only-from"]), "utf8").split("\n").map((x) => x.trim()).filter(Boolean));
+  else if (opt.triage) {
+    const wanted = String(opt.triage).split(",");
+    for (const c of wanted) if (!TRIAGE_CLASSES.includes(c) || c === "auto") fail(`--triage: "${c}" is not one of retranslate, review`);
+    const { verify, docs } = triageResult(run);
+    if (verify.skipped.length) fail(`${verify.skipped.length} finished translation(s) could not be checked (source file location unknown): pass --source-root`);
+    names = new Set(docs.filter((d) => wanted.includes(d.class)).map((d) => d.doc));
+  } else fail("requeue needs --triage <retranslate[,review]> or --only-from <file>");
+  const reason = String(opt.reason ?? (opt.triage ? `structural check failures (${opt.triage})` : "listed for retranslation"));
+  const entries = [];
+  const skipped = [];
+  for (const name of names) {
+    const d = analysis.docs[name];
+    if (!d) skipped.push({ doc: name, reason: "not a discovered document" });
+    else if (!["fresh", "edited"].includes(d.class)) skipped.push({ doc: name, reason: `class ${d.class}: only finished translations are requeued` });
+    else entries.push({ doc: name });
+  }
+  const report = { locale, dryRun: Boolean(opt["dry-run"]), requeue: entries.map((e) => e.doc), skipped, reason };
+  if (!opt["dry-run"] && entries.length) {
+    const runId = opt.run ?? `requeue-${defaultRun()}`;
+    withLock(analysis.paths.state, runId, () => requeueDocs({ dir: analysis.paths.state, run: runId, locale, entries, marker: REQUEUED, reason }));
+    report.run = runId;
+  }
+  if (opt.json) return void console.log(JSON.stringify(report, null, 2));
+  console.log(`${opt["dry-run"] ? "would requeue" : "requeued"} ${entries.length} document(s) for ${locale} (they become stale and are translated again with the old translation as reference)`);
+  for (const e of entries.slice(0, 50)) console.log(`  ~ ${e.doc}`);
+  if (entries.length > 50) console.log(`  … ${entries.length - 50} more`);
+  for (const s of skipped.slice(0, 30)) console.log(`  - ${s.doc}  (${s.reason})`);
 }
 
 // ------------------------------------------------------------------------------------------------ next / jobs
@@ -525,7 +677,7 @@ function finalize() {
       fail(`unreadable result file ${job.output.result}`);
     }
   }
-  // anchor-check-skipped says the environment lacks github-slugger, not that the document is doubtful: warn, do not flag
+  // anchor-check-skipped (older checkers only) says the environment lacked a slugger, not that the document is doubtful: warn, do not flag
   const ENVIRONMENT = new Set(["anchor-check-skipped"]);
   const softFlags = (r.out.soft ?? []).filter((s) => !ENVIRONMENT.has(s.check)).map((s) => `${s.check}: ${String(s.message).slice(0, 120)}`);
   const warnings = (r.out.soft ?? []).filter((s) => ENVIRONMENT.has(s.check)).map((s) => `${s.check}: ${s.message}`);
@@ -891,7 +1043,7 @@ rules:
   if (!opt["dry-run"]) console.log(`\nnext: edit ${t}/profile.yaml (description, readOnly, priority, notes), commit it, then run\n  node ${trPath} scan --profile ${path.join(path.relative(process.cwd(), repo) || ".", t, "profile.yaml")}`);
 }
 
-const commands = { init, scan, status, adopt, next, check, assemble, finalize, fail: failCmd, glossary: glossaryCmd };
+const commands = { init, scan, status, adopt, "fix-anchors": fixAnchorsCmd, "fix-punctuation": fixPunctuationCmd, triage: triageCmd, requeue: requeueCmd, next, check, assemble, finalize, fail: failCmd, glossary: glossaryCmd };
 if (!command) usage("missing command");
 else if (!commands[command]) usage(`unknown command "${command}"`);
 else commands[command]();
