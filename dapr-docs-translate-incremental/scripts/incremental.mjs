@@ -41,7 +41,8 @@ const rel = (abs, base) => normRel(path.relative(base, abs));
 export function buildPlan(ctx) {
   const tr = rel(ctx.engine.tr, ctx.monoRoot);
   const profile = rel(ctx.profileFile, ctx.monoRoot);
-  const sourceRoot = rel(ctx.sourceRoot, ctx.monoRoot);
+  // tr.mjs resolves --source-root against the zh repository, not against the directory it is run from.
+  const sourceRoot = rel(ctx.sourceRoot, ctx.zh.abs);
   const steps = [
     { id: 1, kind: "local-write", name: "sync repos", cwd: ".", file: "pnpm", args: ["run", "sync:repos"] },
     {

@@ -32,7 +32,7 @@ test("plan lists the five steps in order, with the version and repository argume
   assert.equal(sync[sync.indexOf("--source-repo") + 1], "repos/v1.18");
   const scan = plan.steps[2].args;
   assert.equal(scan[scan.indexOf("--profile") + 1], "repos/v1.18_zh/translations/profile.yaml");
-  assert.equal(scan[scan.indexOf("--source-root") + 1], "repos/v1.18_zh/data/source");
+  assert.equal(scan[scan.indexOf("--source-root") + 1], "data/source"); // relative to the zh repository, as tr.mjs resolves it
   assert.equal(plan.steps[3].kind, "agent");
   assert.equal(plan.steps[4].name, "status");
 });
@@ -42,7 +42,7 @@ test("the source root comes from the profile's sources.glob.root", () => {
   const { mono, engine } = makeMono({ version: "v1.18", profile });
   const plan = buildPlan(buildContext({ monoRoot: mono, version: "v1.18", engine }));
   const scan = plan.steps[2].args;
-  assert.equal(scan[scan.indexOf("--source-root") + 1], "repos/v1.18_zh/data/alt");
+  assert.equal(scan[scan.indexOf("--source-root") + 1], "data/alt");
 });
 
 test("the plan contains none of the forbidden commands", () => {

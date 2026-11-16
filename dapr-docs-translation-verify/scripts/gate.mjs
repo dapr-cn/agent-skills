@@ -65,7 +65,9 @@ export function decide({ checks, scope, snapshotChanged = false, newPaths = [] }
 export function buildChecks(ctx) {
   const tr = normRel(path.relative(ctx.monoRoot, ctx.engine.tr));
   const profile = normRel(path.relative(ctx.monoRoot, ctx.profileFile));
-  const sourceRoot = normRel(path.relative(ctx.monoRoot, ctx.sourceRoot));
+  // tr.mjs resolves --source-root against the zh repository, not against the directory it is run from.
+  // A mono-root-relative path points nowhere there and every document is silently skipped.
+  const sourceRoot = normRel(path.relative(ctx.zh.abs, ctx.sourceRoot));
   return [
     {
       name: "status-verify",

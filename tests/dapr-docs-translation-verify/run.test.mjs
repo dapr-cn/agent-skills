@@ -109,7 +109,7 @@ test("the command lines pass version and repository explicitly, relative to the 
   assert.equal(status.args[status.args.indexOf("--fail-on") + 1], FAIL_ON);
   assert.equal(FAIL_ON, "stale,failed,blocked,orphan,drift,glossary");
   assert.ok(status.args.includes("--verify"));
-  assert.equal(status.args[status.args.indexOf("--source-root") + 1], "repos/v1.18_zh/data/source");
+  assert.equal(status.args[status.args.indexOf("--source-root") + 1], "data/source", "relative to the zh repository, as tr.mjs resolves it");
   assert.deepEqual(audit.args.slice(-6), ["--mode", "audit", "--version", "v1.18", "--repo", "repos/v1.18_zh"]);
   assert.ok(docs.args.includes("--dry-run"));
   assert.equal(docs.args[docs.args.indexOf("--version") + 1], "v1.18");
