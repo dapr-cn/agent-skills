@@ -15,9 +15,15 @@ export function proseOf(text) {
   return text.replace(/^(`{3,}|~{3,})[^\n]*\n[\s\S]*?^\1[ \t]*$/gm, "").replace(/`[^`\n]*`/g, "");
 }
 
+/** Matches the term as a whole word, with its plural: policy → policies, bus → buses, topic → topics. */
 export function termRegExp(source) {
-  const body = source.trim().split(/[\s-]+/).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[\\s-]+");
-  return new RegExp(`(?<![\\p{L}\\p{N}_])${body}(?:e?s)?(?![\\p{L}\\p{N}_])`, "iu");
+  const words = source.trim().split(/[\s-]+/).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const last = words.length - 1;
+  // a consonant + y ending takes -ies in the plural; a vowel + y ending (key, day) takes -s
+  const yPlural = /[^aeiou]y$/i.test(words[last]);
+  if (yPlural) words[last] = `${words[last].slice(0, -1)}(?:y|ies)`;
+  const body = words.join("[\\s-]+");
+  return new RegExp(`(?<![\\p{L}\\p{N}_])${body}${yPlural ? "" : "(?:e?s)?"}(?![\\p{L}\\p{N}_])`, "iu");
 }
 
 /** Glossary entries that occur in this text. Terms and do-not-translate names are matched case-insensitively on word boundaries. */
@@ -35,6 +41,14 @@ export function pendingIn(text, pending) {
 }
 
 export const termTargetsOf = (terms) => Object.fromEntries(terms.map((t) => [t.id ?? slugOf(t.source), t.target]));
+
+/** Steps for a terms-only repair (mode terms-only). The old rendering is often an ordinary word too, so the sense decides. */
+export const TERMS_ONLY_STEPS = [
+  "Terms-only steps: output.draft starts as a copy of previous.translation. For each driftTerm, find where the source uses the term (the source word, plurals and hyphenated forms included; ignore code blocks and inline code) and change the translation's rendering of it from old to new there. Rewrite a sentence only where grammar needs it.",
+  "Ordinary senses stay. An occurrence of old that does not render this term is kept byte for byte, for example 主题 meaning theme or subject, 协调 as an everyday verb, 重试策略 standing for retry strategies in general, or a word inside a compound name that is not the term. Each kept occurrence goes into result.keptTerms with its id, the sentence (short) and the reason.",
+  "If a heading that contains a changed term changes, update the same-document links to it (#fragment) so they resolve to the new slug (github-slugger rule). Do not edit links to other documents.",
+  "Change nothing else: every other byte of previous.translation stays as it is. termCandidates must be [] and flags only for a real doubt.",
+].join(" ");
 
 function unifiedDiff(a, b) {
   const r = spawnSync("diff", ["-u", a, b], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
@@ -55,8 +69,9 @@ export function buildJob({ ctx, locale, analysis, d, jobDir, runId, trPath, glos
   const draft = path.join(analysis.paths.drafts, d.doc);
   mkdirSync(jobDir, { recursive: true });
 
+  // a terms-only repair edits one draft in place: a long document is never split into chunks to translate
   let chunks = null;
-  if (Buffer.byteLength(sourceText) > 2 * chunkBytes) {
+  if (d.class !== "drift" && Buffer.byteLength(sourceText) > 2 * chunkBytes) {
     chunks = splitMarkdown(sourceText, chunkBytes).map((c) => {
       const n = String(c.index + 1).padStart(3, "0");
       const src = path.join(jobDir, "chunks", `${n}.src.md`);
@@ -110,8 +125,9 @@ export function buildJob({ ctx, locale, analysis, d, jobDir, runId, trPath, glos
         translate: "translate the whole document.",
         incremental: "previous.translation is the current translation of previous.baseSource; apply previous.diff (base → current source) to it, keep every unchanged part byte for byte, and translate only what the diff changes.",
         "retranslate-with-reference": "translate the whole document; reuse the terminology and phrasing of previous.translation.",
-        "terms-only": "replace only the terms in driftTerms (old → new) in previous.translation, rewriting a sentence only where grammar needs it; do not retranslate anything else.",
+        "terms-only": "repair only the terms in driftTerms (old → new) in previous.translation; the rest of the translation is correct. Follow the terms-only steps below.",
       }[mode]}`,
+      ...(mode === "terms-only" ? [TERMS_ONLY_STEPS] : []),
       chunks ? "Translate chunks/NNN.src.md in order into chunks/NNN.out.md (one file per chunk, same structure), then run commands.assemble: it joins them into output.draft and checks it." : `Write the translation to output.draft (UTF-8, no BOM, LF, one trailing newline).`,
       "Use glossary.terms[].target for every listed term and keep glossary.doNotTranslate names as they are. glossary.pending lists renderings chosen in other documents that are not confirmed yet: reuse them when they fit, so the glossary converges. Follow rules, localeNotes and style (see references/translation-procedure.md §3).",
       `Run commands.check; fix the draft from its report, at most 2 rounds. Then write output.result as JSON: {"doc","ok","model","retries","seconds","flags":[],"termCandidates":[{"source","target","note","doNotTranslate"}]} and reply with that JSON only. termCandidates: only product-specific terms and names that occur in the document and that you rendered in the translation, not in glossary.terms; no file names, flags, identifiers, titles or ordinary words (they are filtered out anyway).`,

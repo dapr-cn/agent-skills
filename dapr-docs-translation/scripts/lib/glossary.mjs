@@ -249,6 +249,11 @@ export function auditGlossary(glossary, { docs = [], minDocs = DEFAULT_PROMOTE_A
       keep.push({ id: t.id, target: t.target, why: "human or locked", ...ev });
       continue;
     }
+    // reverted to English (applyRevert): the rendering is the source word, held by a do-not-translate entry. Not a term to judge.
+    if (isKeptInEnglish(t, glossary)) {
+      keep.push({ id: t.id, target: t.target, why: "kept in English (do-not-translate)", present: ev.present, using: ev.using, inconsistent: [] });
+      continue;
+    }
     const reason = screenCandidate({ source: t.source, target: t.target }, { ignore: ign });
     if (reason) {
       remove.push({ id: t.id, source: t.source, target: t.target, kind: "term", reason, ...ev });
@@ -275,6 +280,75 @@ export function auditGlossary(glossary, { docs = [], minDocs = DEFAULT_PROMOTE_A
   for (const [target, ids] of byTarget) if (ids.length > 1) notes.push({ kind: "collision", target, ids });
   for (const k of keep) if (k.inconsistent?.length) notes.push({ kind: "inconsistent", id: k.id, target: k.target, docs: k.inconsistent });
   return { keep, demote, remove, notes };
+}
+
+/** A term whose preferred translation is its source word and that a do-not-translate entry holds: kept in English on purpose. */
+export function isKeptInEnglish(term, glossary) {
+  const same = (a, b) => String(a ?? "").toLowerCase() === String(b ?? "").toLowerCase();
+  return Boolean(term.source) && same(term.target, term.source) && (glossary?.doNotTranslate ?? []).some((n) => same(n.term, term.source));
+}
+
+/**
+ * Decide terms by hand (`tr.mjs glossary revert`). Pure: the caller does the file I/O.
+ *   to "source": the term keeps its English form: target = source, and a do-not-translate entry holds the word so later
+ *                translations keep it as written. Finished translations are not changed (their recorded renderings may drift later).
+ *   to "remove": the term row is deleted.
+ * Either way, pending candidates of the same term id are withdrawn so "confirmation by use" cannot bring the old rendering back.
+ * Locked and human-origin terms are skipped and reported; an unknown id is reported as not-found; a term already in the target state is "already".
+ * ids: term ids (slugs). Returns { glossary, pending, changes, outcomes, withdrawn, versionBumps }; `changes` are changes.jsonl rows.
+ */
+export function applyRevert(glossary, pending, { ids = [], to, reason = "" } = {}) {
+  if (!["source", "remove"].includes(to)) throw new Error(`revert: to must be "source" or "remove" (got "${to}")`);
+  const g = structuredClone(glossary ?? emptyGlossary());
+  g.terms ??= [];
+  g.doNotTranslate ??= [];
+  const p = structuredClone(pending ?? emptyPending());
+  p.entries ??= [];
+  const changes = [];
+  const outcomes = [];
+  const withdrawn = [];
+  const why = String(reason ?? "").trim();
+  for (const id of ids) {
+    const t = g.terms.find((x) => x.id === id);
+    if (!t) {
+      outcomes.push({ id, status: "not-found" });
+      continue;
+    }
+    if (t.locked || t.origin === "human") {
+      outcomes.push({ id, status: "skipped", why: t.locked ? "locked" : "human", source: t.source, target: t.target });
+      continue;
+    }
+    const names = g.doNotTranslate.findIndex((n) => String(n.term).toLowerCase() === String(t.source).toLowerCase());
+    if (to === "source") {
+      if (isKeptInEnglish(t, g)) {
+        outcomes.push({ id, status: "already", source: t.source, target: t.target });
+        continue;
+      }
+      const from = t.target;
+      t.target = t.source;
+      t.note = [t.note, why ? `kept in English: ${why}` : "kept in English"].filter(Boolean).join("; ");
+      if (names < 0) g.doNotTranslate.push({ term: t.source, note: why ? `reverted: ${why}` : "reverted to English", origin: "human", locked: false });
+      changes.push({ op: "revert", id, kind: "term", from, target: t.source, to: "source", doNotTranslate: names < 0 ? "added" : "already", reason: why || null });
+      outcomes.push({ id, status: "reverted", source: t.source, from, target: t.source, doNotTranslate: names < 0 ? "added" : "already" });
+    } else {
+      g.terms = g.terms.filter((x) => x !== t);
+      changes.push({ op: "revert", id, kind: "term", from: t.target, target: null, to: "removed", reason: why || null });
+      outcomes.push({ id, status: "removed", source: t.source, from: t.target });
+    }
+    // candidates still pending for this term id would otherwise be promoted back by use
+    const staged = p.entries.filter((e) => e.id === id && e.kind === "term");
+    if (staged.length) {
+      p.entries = p.entries.filter((e) => !(e.id === id && e.kind === "term"));
+      for (const e of staged) {
+        withdrawn.push({ id, target: e.target, docs: e.docs.length });
+        changes.push({ op: "revert", id, kind: "pending", from: e.target, target: null, to: "withdrawn", reason: why || null });
+      }
+    }
+  }
+  const touched = changes.length > 0;
+  if (touched) g.version = (g.version ?? 0) + 1;
+  for (const c of changes) c.version = g.version;
+  return { glossary: g, pending: p, changes, outcomes, withdrawn, versionBumps: touched ? 1 : 0 };
 }
 
 /** Apply an audit: drop removed and demoted entries from the glossary, stage the demoted ones, one version step. */

@@ -13,18 +13,20 @@
 //   check    structural check of a job's draft          assemble  join chunk outputs into the draft + check
 //   finalize accept a checked draft and record it       fail      record a failed attempt (blocked at 3)
 //   glossary merge|audit|bootstrap   fold job candidates in / re-check existing entries / build a first glossary from an existing translation
+//   glossary revert  decide terms by hand: --to source keeps the English word (do-not-translate), --to remove deletes the row   --ids a,b | --ids-from F  [--reason T] [--dry-run]
+//   orphan prune     drop records of documents gone from the source whose translation file is gone too (files on disk are kept)   [--only G] [--only-from F] [--dry-run]
 //
 // Exit codes: 0 ok, 1 a gate / check failed, 2 usage or input error, 3 lock busy.
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { analyse, breakdown, globMatcher, loadProfile, pickLocales, plan, summarise, usageByModel } from "./lib/core.mjs";
+import { analyse, breakdown, contentPath, globMatcher, loadProfile, oldRenderingInUse, pickLocales, plan, summarise, usageByModel } from "./lib/core.mjs";
 import { alignSlots, buildBootstrap, extractSlots, matchEvidence, normalisePair, parenPairs, starterStyle } from "./lib/bootstrap.mjs";
-import { DEFAULT_PROMOTE_AFTER, applyAudit, auditGlossary, docTitleOf, emptyGlossary, emptyPending, mergeCandidates } from "./lib/glossary.mjs";
-import { buildJob, jobSlug, termsIn, termTargetsOf } from "./lib/jobs.mjs";
+import { DEFAULT_PROMOTE_AFTER, applyAudit, applyRevert, auditGlossary, docTitleOf, emptyGlossary, emptyPending, mergeCandidates } from "./lib/glossary.mjs";
+import { buildJob, jobSlug, slugOf, termsIn, termTargetsOf } from "./lib/jobs.mjs";
 import { joinChunks } from "./lib/chunk.mjs";
-import { acquireLock, adoptDocs, appendLedger, failDoc, finalizeDoc, readJson, recordGlossary, rehashDocs, releaseLock, requeueDocs, sha256File } from "./lib/state.mjs";
+import { acquireLock, adoptDocs, appendLedger, failDoc, finalizeDoc, pruneOrphans, readJson, recordGlossary, rehashDocs, releaseLock, requeueDocs, sha256File } from "./lib/state.mjs";
 import { fixAnchors } from "./lib/anchors.mjs";
 import { fixPunctuation } from "./lib/punctuation.mjs";
 import { TRIAGE_CLASSES, triage } from "./lib/triage.mjs";
@@ -36,7 +38,7 @@ const REPEATABLE = new Set(["locale-list", "glob", "exclude", "only", "doc"]);
 
 const argv = process.argv.slice(2);
 const command = argv.shift();
-const sub = command === "glossary" ? argv.shift() : undefined;
+const sub = command === "glossary" || command === "orphan" ? argv.shift() : undefined;
 const opt = {};
 for (let i = 0; i < argv.length; i += 1) {
   if (!argv[i].startsWith("--")) usage(`unexpected argument ${argv[i]}`);
@@ -53,7 +55,7 @@ for (let i = 0; i < argv.length; i += 1) {
 }
 
 function usage(message) {
-  console.error(`tr: ${message}\nusage: tr.mjs init|scan|status|adopt|next|check|assemble|finalize|fail|glossary merge — see the header of ${trPath}`);
+  console.error(`tr: ${message}\nusage: tr.mjs init|scan|status|adopt|next|check|assemble|finalize|fail|glossary merge|audit|bootstrap|revert|orphan prune — see the header of ${trPath}`);
   process.exit(2);
 }
 function fail(message, code = 2) {
@@ -751,6 +753,8 @@ function finalize() {
       glossaryVersion, glossarySha256: glossaryFile ? sha256File(glossaryFile) : undefined, sourceRevision: job.source.revision ?? undefined,
       model: opt.model ?? result.model, retries: num("retries") ?? result.retries, seconds: num("seconds") ?? result.seconds, tokens,
       termTargets: merged ? termTargetsOf(termsIn(readFileSync(job.source.path, "utf8"), merged.glossary).terms) : job.termTargets,
+      // a terms-only repair judged the old renderings it was given: the English words are now the record, and the kept ordinary senses are not judged again
+      reviewedTerms: job.mode === "terms-only" ? Object.fromEntries((job.driftTerms ?? []).map((t) => [t.id, t.old])) : undefined,
       keepBase: ctx.profile.keepBaseSource === false ? false : undefined,
     });
     if (merged) {
@@ -764,7 +768,8 @@ function finalize() {
         glossaryReport.error = error.message;
       }
     }
-    console.log(JSON.stringify({ ...out, status: flags.length ? "done_flagged" : "done", flags, warnings, glossary: glossaryReport, translation: path.relative(job.repo, final) }, null, 2));
+    const keptTerms = Array.isArray(result.keptTerms) ? result.keptTerms : [];
+    console.log(JSON.stringify({ ...out, status: flags.length ? "done_flagged" : "done", flags, warnings, keptTerms, glossary: glossaryReport, translation: path.relative(job.repo, final) }, null, 2));
   } finally {
     if (glossaryLock && glossaryLock.status !== "busy") releaseLock(job.state, runId);
   }
@@ -772,7 +777,7 @@ function finalize() {
 
 function failCmd() {
   const { job } = readJob();
-  const out = failDoc({ dir: job.state, run: opt.run ?? job.run ?? defaultRun(), doc: job.doc, reason: need("reason"), locale: job.locale, sourceSha256: job.source.sha256 });
+  const out = failDoc({ dir: job.state, run: opt.run ?? job.run ?? defaultRun(), doc: job.doc, reason: need("reason"), locale: job.locale, sourceSha256: job.source.sha256, terms: job.mode === "terms-only" });
   console.log(JSON.stringify({ doc: job.doc, ...out }));
 }
 
@@ -782,7 +787,8 @@ function glossaryCmd() {
   if (sub === "merge") return glossaryMerge();
   if (sub === "audit") return glossaryAudit();
   if (sub === "bootstrap") return glossaryBootstrap();
-  return usage(`unknown glossary command "${sub ?? ""}" (expected: merge, audit, bootstrap)`);
+  if (sub === "revert") return glossaryRevert();
+  return usage(`unknown glossary command "${sub ?? ""}" (expected: merge, audit, bootstrap, revert)`);
 }
 
 /** The finished translations with their source text: the evidence an audit judges by. */
@@ -896,6 +902,118 @@ function glossaryBootstrap() {
   if (report.terms.length > 60) console.log(`  … ${report.terms.length - 60} more (use --json)`);
   console.log(`  names: ${report.doNotTranslate.map((n) => n.term).join(", ") || "-"}`);
   console.log(report.applied ? `applied: glossary v${report.version}` : "dry run: nothing written (use --apply; --merge adds to an existing glossary)");
+}
+
+/** Term ids from --ids (comma-separated) and --ids-from (one per line or comma-separated; `#` starts a comment). */
+function idList() {
+  const ids = [];
+  if (opt.ids) ids.push(...String(opt.ids).split(","));
+  if (opt["ids-from"]) {
+    let text;
+    try {
+      text = readFileSync(path.resolve(runDir(), opt["ids-from"]), "utf8");
+    } catch (error) {
+      fail(`cannot read --ids-from: ${error.message}`);
+    }
+    for (const line of text.split("\n")) ids.push(...line.replace(/#.*$/, "").split(","));
+  }
+  return [...new Set(ids.map((x) => slugOf(x.trim())).filter(Boolean))];
+}
+
+/**
+ * Finished translations that record a reverted term, or still show its old rendering. `drift` marks the ones the next scan judges as
+ * drift (the same test as core's driftOf: the old rendering is in the text and the source uses the term). Edited files are never
+ * judged. Reported only; nothing is requeued or retranslated here.
+ */
+function revertRefs(analysis, outcomes) {
+  const refs = [];
+  for (const o of outcomes.filter((x) => x.status === "reverted")) {
+    for (const d of Object.values(analysis.docs)) {
+      if (!["fresh", "edited", "drift"].includes(d.class)) continue;
+      const snap = analysis.snapshot.docs[d.doc];
+      const recorded = snap?.termTargets?.[o.id];
+      let text = "";
+      try {
+        text = readFileSync(d.translationPath, "utf8");
+      } catch {
+        /* a missing file cannot still contain the rendering */
+      }
+      const shows = text.includes(o.from);
+      if (recorded === undefined && !shows) continue;
+      let sourceText = null;
+      if (shows && d.abs) {
+        try {
+          sourceText = readFileSync(d.abs, "utf8");
+        } catch {
+          /* no source: the document cannot be judged */
+        }
+      }
+      const drift = d.class !== "edited" && oldRenderingInUse({ id: o.id, old: o.from, snap, text, sourceText, term: { source: o.source } });
+      refs.push({ id: o.id, doc: d.doc, old: o.from, recorded: recorded ?? null, drift });
+    }
+  }
+  return refs;
+}
+
+/**
+ * glossary revert: decide terms by hand. `--to source` keeps the English word (target = source, do-not-translate entry) and leaves every
+ * finished translation as it is; `--to remove` deletes the term row. Same write path as audit --apply: the glossary and its log, the ledger,
+ * and the snapshot's glossary version/hash. Without --dry-run it writes; with --dry-run it only reports.
+ */
+function glossaryRevert() {
+  const to = need("to");
+  if (!["source", "remove"].includes(to)) usage(`--to must be source or remove (got "${to}")`);
+  const ids = idList();
+  if (!ids.length) usage("nothing to revert: pass --ids <term>[,<term>…] or --ids-from <file>");
+  const { locale, analysis } = single();
+  if (!analysis.glossary.exists || !analysis.glossary.data) fail("there is no glossary to revert terms in");
+  const dryRun = Boolean(opt["dry-run"]);
+  const runId = opt.run ?? defaultRun();
+  const reason = opt.reason ?? "";
+  const glossaryDir = analysis.paths.glossary;
+  let res = applyRevert(analysis.glossary.data, readPending(glossaryDir), { ids, to, reason });
+  let applied = false;
+  if (!dryRun && res.versionBumps) {
+    withLock(analysis.paths.state, runId, () => {
+      // re-read under the lock: the plan above was made before it, and the glossary may have changed since
+      const pendingBefore = readPending(glossaryDir);
+      res = applyRevert(readJson(analysis.glossary.file), pendingBefore, { ids, to, reason });
+      if (!res.versionBumps) return;
+      const counts = Object.fromEntries(["reverted", "removed", "already", "not-found", "skipped"].map((k) => [k, res.outcomes.filter((o) => o.status === k).length]));
+      persistGlossary({
+        glossaryDir, stateDir: analysis.paths.state, locale, runId,
+        merged: { glossary: res.glossary, pending: res.pending, versionBumps: res.versionBumps, changes: res.changes, rejected: [] },
+        pendingBefore, note: `revert (${to}): ${counts.reverted + counts.removed} changed, ${counts.already} already, ${counts["not-found"]} not found, ${counts.skipped} skipped${reason ? `; ${reason}` : ""}`,
+      });
+      applied = true;
+    });
+  }
+  const refs = to === "source" ? revertRefs(analysis, res.outcomes) : [];
+  const report = {
+    locale, to, reason: reason || null, run: runId, dryRun, applied,
+    version: res.glossary.version, outcomes: res.outcomes, withdrawnPending: res.withdrawn,
+    affected: { documents: new Set(refs.map((r) => r.doc)).size, drift: refs.filter((r) => r.drift).length, rows: refs },
+  };
+  if (opt.json) return void console.log(JSON.stringify(report, null, 2));
+  const count = (k) => res.outcomes.filter((o) => o.status === k).length;
+  console.log(`glossary revert (${locale}) → ${to}: ${ids.length} requested | reverted ${count("reverted")} | removed ${count("removed")} | already ${count("already")} | not found ${count("not-found")} | skipped ${count("skipped")}`);
+  for (const o of res.outcomes) {
+    const line = o.status === "reverted" ? `${o.id.padEnd(26)} ${String(o.from).padEnd(12)} → ${o.target}  (kept in English${o.doNotTranslate === "added" ? ", do-not-translate added" : ""})`
+      : o.status === "removed" ? `${o.id.padEnd(26)} ${String(o.from).padEnd(12)} → removed`
+        : o.status === "already" ? `${o.id.padEnd(26)} already in the target state`
+          : o.status === "skipped" ? `${o.id.padEnd(26)} not changed: ${o.why === "locked" ? "locked" : "human-owned"} (${o.target})`
+            : `${o.id.padEnd(26)} not found in the glossary`;
+    console.log(`  ${o.status.padEnd(9)} ${line}`);
+  }
+  for (const w of res.withdrawn) console.log(`  withdrawn pending candidate for ${w.id} (${w.target}, seen in ${w.docs} document(s))`);
+  if (refs.length) {
+    const docs = new Set(refs.map((r) => r.doc)).size;
+    console.log(`\nfinished translations that record or still show a reverted term: ${docs} document(s), ${refs.filter((r) => r.drift).length} still use the old rendering where the source uses the term and will be judged drift by the next scan (nothing requeued or retranslated here)`);
+    for (const r of refs.filter((x) => x.drift).slice(0, 30)) console.log(`  drift  ${r.doc}  (${r.id}: ${r.old})`);
+  }
+  if (applied) console.log(`applied: glossary v${res.glossary.version}, changes logged in glossary/changes.jsonl`);
+  else if (dryRun) console.log(res.versionBumps ? "dry run: nothing written (drop --dry-run to apply)" : "dry run: nothing to change");
+  else console.log("nothing to change: every requested term is already in the target state, missing, or protected");
 }
 
 function glossaryMerge() {
@@ -1043,7 +1161,50 @@ rules:
   if (!opt["dry-run"]) console.log(`\nnext: edit ${t}/profile.yaml (description, readOnly, priority, notes), commit it, then run\n  node ${trPath} scan --profile ${path.join(path.relative(process.cwd(), repo) || ".", t, "profile.yaml")}`);
 }
 
-const commands = { init, scan, status, adopt, "fix-anchors": fixAnchorsCmd, "fix-punctuation": fixPunctuationCmd, triage: triageCmd, requeue: requeueCmd, next, check, assemble, finalize, fail: failCmd, glossary: glossaryCmd };
+// ------------------------------------------------------------------------------------------------ orphan
+
+function orphanCmd() {
+  if (sub === "prune") return orphanPrune();
+  return usage(`unknown orphan command "${sub ?? ""}" (expected: prune)`);
+}
+
+/**
+ * orphan prune: remove records of documents the source no longer has, but only when their translation file is gone as well.
+ * An orphan whose translation file still exists is never touched; it is listed as kept. Without --dry-run it writes (snapshot with
+ * backup rotation, one ledger line per document); with --dry-run it only reports.
+ */
+function orphanPrune() {
+  const { ctx, locale, analysis } = single();
+  const listed = opt["only-from"] ? new Set(readFileSync(path.resolve(runDir(), opt["only-from"]), "utf8").split("\n").map((x) => x.trim()).filter(Boolean)) : null;
+  const byGlob = opt.only ? globMatcher(opt.only) : () => true;
+  const only = (doc) => byGlob(doc) && (!listed || listed.has(doc));
+  const orphans = Object.values(analysis.docs).filter((d) => d.class === "orphan" && only(d.doc));
+  const prune = [];
+  const kept = [];
+  for (const d of orphans) {
+    const translation = contentPath(ctx, locale, d.doc);
+    if (existsSync(translation)) kept.push({ doc: d.doc, translation: path.relative(ctx.repo, translation).split(path.sep).join("/") });
+    else prune.push({ doc: d.doc, status: d.status, reason: "source no longer discovered; translation file already gone" });
+  }
+  const dryRun = Boolean(opt["dry-run"]);
+  const runId = opt.run ?? `prune-${defaultRun()}`;
+  let applied = false;
+  if (!dryRun && prune.length) {
+    withLock(analysis.paths.state, runId, () => pruneOrphans({ dir: analysis.paths.state, run: runId, locale, entries: prune }));
+    applied = true;
+  }
+  const report = { locale, run: runId, dryRun, applied, orphans: orphans.length, prune: prune.map((p) => p.doc), kept };
+  if (opt.json) return void console.log(JSON.stringify(report, null, 2));
+  console.log(`orphan prune (${locale}): ${orphans.length} orphan record(s) → ${prune.length} to prune (source and translation file both gone), ${kept.length} kept (translation file still on disk)`);
+  for (const p of prune.slice(0, 60)) console.log(`  ${dryRun ? "would prune" : applied ? "pruned" : "prune"}  ${p.doc}`);
+  if (prune.length > 60) console.log(`  … ${prune.length - 60} more (use --json)`);
+  for (const k of kept) console.log(`  kept    ${k.doc}  (${k.translation} still exists)`);
+  if (applied) console.log(`applied: ${prune.length} record(s) removed from snapshot.json; translation files untouched`);
+  else if (dryRun) console.log(prune.length ? "dry run: nothing written (drop --dry-run to apply)" : "dry run: nothing to prune");
+  else console.log(prune.length ? "nothing written" : "nothing to prune");
+}
+
+const commands = { init, scan, status, adopt, "fix-anchors": fixAnchorsCmd, "fix-punctuation": fixPunctuationCmd, triage: triageCmd, requeue: requeueCmd, next, check, assemble, finalize, fail: failCmd, glossary: glossaryCmd, orphan: orphanCmd };
 if (!command) usage("missing command");
 else if (!commands[command]) usage(`unknown command "${command}"`);
 else commands[command]();

@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { termRegExp, proseOf } from "./jobs.mjs";
 import { baseSourcePath, ledgerTail, loadSnapshotChain, lockHeld, sha256 } from "./state.mjs";
 import { parseYaml } from "./yaml.mjs";
 
@@ -239,16 +240,56 @@ export function classify(d, snap, diskSha) {
   if (["done", "done_flagged", "stale", "drift", "orphaned", "superseded"].includes(st)) {
     if (snap.sourceSha256 !== d.sha256) return { class: "stale", reason: "source changed since the recorded translation", edited };
     if (!hasFile) return { class: "missing", reason: "recorded as translated but the translation file is gone", edited: false };
-    if (st === "drift") return { class: "drift", reason: "glossary preferred term changed after this translation", edited };
+    // a hand-edited file is never rewritten by a terms-only repair: it stays `edited` for a person to decide
     if (edited) return { class: "edited", reason: "translation file differs from the recorded hash (edited outside a run)", edited: true };
+    if (st === "drift") return snap.attempts >= 3 ? { class: "blocked", reason: `terms-only repair failed ${snap.attempts} times; reset attempts to 0 in snapshot.json to retry`, edited: false } : { class: "drift", reason: "a terms-only repair is still pending", edited: false };
     return { class: "fresh", reason: "", edited: false };
   }
   return { class: "new", reason: `unrecognised recorded status "${st}"`, edited };
 }
 
-/** Terms whose preferred translation changed since this document was translated and whose old wording is still in the text. */
-function driftOf(snap, glossaryData, translationFile) {
-  if (!snap?.termTargets || !glossaryData?.terms) return [];
+/** Reverted terms (`glossary revert --to source`) and the rendering each one had: the latest revert row per term id, from changes.jsonl. */
+export function revertedRenderings(glossaryDir) {
+  const out = new Map();
+  let text;
+  try {
+    text = readFileSync(path.join(glossaryDir, "changes.jsonl"), "utf8");
+  } catch {
+    return out;
+  }
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (row.op === "revert" && row.kind === "term" && row.to === "source" && row.from) out.set(row.id, row.from);
+  }
+  return out;
+}
+
+/**
+ * Is a term's old rendering still in a finished translation, where the source uses the term as a term?
+ * Only the prose of the source counts (code is ignored). A document that already took part in a terms-only repair for this
+ * rendering (`reviewedTerms`) is not judged again: whatever old wording is left was judged ordinary there.
+ */
+export function oldRenderingInUse({ id, old, snap, text, sourceText, term }) {
+  if (snap?.reviewedTerms?.[id] === old) return false;
+  if (!text.includes(old)) return false;
+  if (sourceText === null || sourceText === undefined) return false;
+  return Boolean(term?.source) && termRegExp(term.source).test(proseOf(sourceText));
+}
+
+/**
+ * Terms whose preferred translation changed and whose old wording is still in the text. Two sources:
+ *   termTargets  — the rendering recorded when the document was translated (the term changed later);
+ *   revertedTerms — terms reverted to English by a human (changes.jsonl), for documents with no record of the term
+ *                   (adopted baselines, documents finished before the term was known) and for records that already name the English word.
+ */
+function driftOf({ snap, glossaryData, translationFile, sourceFile, reverted }) {
+  if (!glossaryData?.terms) return [];
   let text;
   try {
     text = readFileSync(translationFile, "utf8");
@@ -256,9 +297,25 @@ function driftOf(snap, glossaryData, translationFile) {
     return [];
   }
   const out = [];
-  for (const [id, old] of Object.entries(snap.termTargets)) {
+  for (const [id, old] of Object.entries(snap?.termTargets ?? {})) {
     const t = glossaryData.terms.find((x) => x.id === id);
-    if (t?.target && t.target !== old && text.includes(old)) out.push({ id, old, new: t.target });
+    if (t?.target && t.target !== old && text.includes(old) && snap?.reviewedTerms?.[id] !== old) out.push({ id, old, new: t.target });
+  }
+  if (reverted?.size) {
+    let sourceText = null;
+    for (const [id, old] of reverted) {
+      if (out.some((x) => x.id === id)) continue;
+      const t = glossaryData.terms.find((x) => x.id === id);
+      if (!t?.target || t.target === old || !text.includes(old)) continue;
+      if (sourceText === null && sourceFile) {
+        try {
+          sourceText = readFileSync(sourceFile, "utf8");
+        } catch {
+          sourceText = undefined;
+        }
+      }
+      if (oldRenderingInUse({ id, old, snap, text, sourceText, term: t })) out.push({ id, old, new: t.target });
+    }
   }
   return out;
 }
@@ -268,6 +325,7 @@ export function analyse(ctx, locale, options = {}) {
   const found = discover(ctx, locale, options);
   const { snapshot, source: snapshotSource } = loadSnapshot(paths.state);
   const glossary = glossaryInfo(paths, snapshot);
+  const reverted = revertedRenderings(paths.glossary);
   // a document whose last ledger event is `doc_start`, with no run active, was abandoned mid-way
   const tail = lockHeld(paths.state) ? new Map() : ledgerTail(paths.state);
   const docs = {};
@@ -277,9 +335,10 @@ export function analyse(ctx, locale, options = {}) {
     const diskSha = fileSha(translationPath);
     let c = classify(d, snap, diskSha);
     let driftTerms = [];
-    if (c.class === "fresh" || c.class === "edited") {
-      driftTerms = driftOf(snap, glossary.data, translationPath);
-      if (driftTerms.length) c = { ...c, class: "drift", reason: `preferred term changed: ${driftTerms.map((t) => `${t.id}: ${t.old} → ${t.new}`).join("; ")}` };
+    if (c.class === "fresh" || c.class === "drift") {
+      driftTerms = driftOf({ snap, glossaryData: glossary.data, translationFile: translationPath, sourceFile: d.abs, reverted });
+      if (driftTerms.length) c = { class: "drift", reason: `preferred term changed: ${driftTerms.map((t) => `${t.id}: ${t.old} → ${t.new}`).join("; ")}`, edited: false };
+      else if (c.class === "drift") c = { class: "fresh", reason: "", edited: false }; // the pending repair is no longer needed
     }
     if (["new", "stale", "drift", "failed", "missing"].includes(c.class) && tail.get(d.doc)?.event === "doc_start") {
       const attempts = (snap?.attempts ?? 0) + tail.get(d.doc).starts;

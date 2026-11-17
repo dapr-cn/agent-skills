@@ -84,6 +84,10 @@ export function replayLedger(file) {
       continue;
     }
     if (!e.doc) continue;
+    if (e.event === "doc_orphan_pruned") {
+      delete docs[e.doc]; // the record was removed on purpose: a replay must not bring it back
+      continue;
+    }
     const d = (docs[e.doc] ??= { status: "interrupted", attempts: 0 });
     if (e.event === "doc_start") Object.assign(d, { status: "interrupted", attempts: d.attempts + 1 });
     else if (e.event === "doc_done") Object.assign(d, { status: e.status ?? "done", sourceSha256: e.sourceSha256, translationSha256: e.translationSha256, runId: e.run, doneAt: e.ts, flags: e.flags ?? [] });
@@ -217,6 +221,9 @@ export function finalizeDoc(o) {
     runId: run, doneAt: now, reviewedAt: prior.reviewedAt ?? null, flags, note: prior.note ?? "",
   };
   delete entry.adopted;
+  // terms-only repairs record which old renderings were judged (reviewedTerms); any other translation starts without that record
+  if (o.reviewedTerms) entry.reviewedTerms = { ...(prior.reviewedTerms ?? {}), ...o.reviewedTerms };
+  else delete entry.reviewedTerms;
   for (const k of ["model", "retries", "seconds", "tokens", "termTargets"]) {
     if (o[k] !== undefined) entry[k] = o[k];
     else delete entry[k];
@@ -312,12 +319,37 @@ export function requeueDocs({ dir, run, locale, entries, marker, reason }) {
   return { requeued: done.map((e) => e.doc) };
 }
 
+/**
+ * Drop orphan records (`tr.mjs orphan prune`): documents the snapshot still lists but the source no longer has, whose translation
+ * file is gone too. The caller checks both conditions. One snapshot write (backups rotate as usual), one `doc_orphan_pruned` ledger
+ * line per document. Translation files and state/base copies are not touched.
+ */
+export function pruneOrphans({ dir, run, locale, entries }) {
+  const snapshot = loadSnapshotChain(dir, locale).snapshot;
+  const now = new Date().toISOString();
+  const done = [];
+  for (const e of entries) {
+    const prior = snapshot.docs[e.doc];
+    if (!prior) continue;
+    delete snapshot.docs[e.doc];
+    done.push({ ...e, prior });
+  }
+  if (done.length) {
+    snapshot.updatedAt = now;
+    snapshot.lastRun = run;
+    writeSnapshot(dir, run, `${JSON.stringify(snapshot, null, 2)}\n`);
+    for (const e of done) appendLedger(dir, { event: "doc_orphan_pruned", run, doc: e.doc, status: e.prior.status ?? null, translationSha256: e.prior.translationSha256 ?? null, reason: e.reason });
+  }
+  return { pruned: done.map((e) => e.doc) };
+}
+
 /** A document that did not pass: bump attempts, record `failed` (or `blocked` at 3 attempts), keep the draft where it is. */
-export function failDoc({ dir, run, doc, reason, locale, sourceSha256 }) {
+export function failDoc({ dir, run, doc, reason, locale, sourceSha256, terms = false }) {
   const snapshot = loadSnapshotChain(dir, locale).snapshot;
   const prior = snapshot.docs[doc] ?? {};
   const attempts = (prior.attempts ?? 0) + 1;
-  const status = attempts >= 3 ? "blocked" : "failed";
+  // a failed terms-only repair stays `drift` (never a full retranslation); the document is still pending the same repair
+  const status = attempts >= 3 ? "blocked" : terms ? "drift" : "failed";
   const now = new Date().toISOString();
   snapshot.docs[doc] = { ...prior, status, attempts, runId: run, note: reason ?? prior.note ?? "", ...(sourceSha256 && !prior.sourceSha256 ? { sourceSha256 } : {}) };
   snapshot.updatedAt = now;
