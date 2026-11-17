@@ -39,6 +39,8 @@ description: 'Unattended, resumable documentation translation with durable state
 
 已完成的译文校验不过(`status --verify`):`tr.mjs triage` 分类 → `fix-punctuation` / `fix-anchors` 脚本修 → `requeue --triage retranslate` 送回待办,不要手改结构。
 
+人对术语的决定用 `tr.mjs glossary revert --to source|remove --ids <id,…>`:`source` 让术语保留英文原文(译法等于源词、加入 do-not-translate),`remove` 删除该术语行;两者都先加 `--dry-run` 核对,locked 与人工条目会被跳过。它不改已完成译文、不重译;之后 `scan` 把仍用旧译法、且源文确实用到该术语的已完成译文判为 `drift`,由 `next` 生成 `terms-only` 任务修复(只换术语用法,普通词义保留并列入 `keptTerms`);修复记账后这些旧译法不再重判。快照里的 orphan 记录(源已无、译文也已不在磁盘上)用 `tr.mjs orphan prune` 清理(先 `--dry-run`);译文仍在磁盘上的 orphan 不动,只报告。
+
 没有待办时不要硬找活干,走 `references/run-and-report.md` 的"无待办"一节。
 
 新接入一个仓库:`node <SKILL_DIR>/scripts/tr.mjs init --repo <repo> --source-root <docs 目录> --glob "**/*.md" --locale zh-CN` 生成 `translations/`(profile、README、各语言目录),再按 `references/profile-spec.md` 补全 profile。源文档来自上游子模块等没有现成 glob 的情况,改用 profile 的 `sources.discovery` 适配器。

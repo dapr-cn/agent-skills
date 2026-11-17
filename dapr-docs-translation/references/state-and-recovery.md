@@ -49,7 +49,7 @@ T/
 | `done` | 通过全部硬校验 |
 | `done_flagged` | 通过硬校验但带 `flags`,需要人看 |
 | `stale` | 源文本哈希变了 |
-| `drift` | 术语表首选译法后来被改了,译文里还含旧译法(`scan` 用 `termTargets` 与当前术语表对比自动判定) |
+| `drift` | 术语表首选译法后来被改了,译文里还含旧译法(`scan` 判定,见 §5 第 4 步);一次 `terms-only` 修复失败也记为 `drift`(不退回整篇重译),连续 3 次失败记 `blocked` |
 | `failed` | 本次没通过硬校验,草稿在 `drafts/` |
 | `blocked` | `attempts ≥ 3`,等人处理;人把 `attempts` 改回 0 即重新进入待办 |
 | `interrupted` | 上次运行在这一篇中途中断 |
@@ -100,14 +100,14 @@ node SD/scripts/statectl.mjs ledger append --dir STATE --json '{"event":"doc_sta
    | 记录为 `blocked`,或 `failed`/`interrupted` 且 `attempts ≥ 3` | `blocked`,跳过 |
    | 记录为 `failed` / `interrupted` | 同名归类,重试 |
    | 记录的 `sourceSha256` 与当前源不同 | `stale`;若译文文件也被人改过,`edited: true`,进 `attention` |
-   | 记录为 `drift`,且源未变 | `drift` |
+   | 记录为 `drift`,且源未变 | `drift`(仍有待修复的旧译法时;已修复则为 `fresh`) |
    | 源未变但译文文件不在 | `missing`,当作待翻译 |
    | 源未变,译文文件哈希与记录不同 | `edited`:人在运行之外改过,计入完成,**不覆盖** |
    | 最后一个台账事件是 `doc_start` 且无活动运行 | `interrupted`(3 次则 `blocked`) |
    | 源未变,译文哈希一致 | `fresh` |
-   | 快照里有、发现里没有 | `orphan` |
+   | 快照里有、发现里没有 | `orphan`(译文也已不在磁盘上时,`tr.mjs orphan prune` 移除记录;译文仍在则不动、只报告) |
 
-   `drift` 由 `scan` 判定:快照里记录了译成时每个术语的译法(`termTargets`),术语表里该术语的 `target` 后来变了、而译文里仍含旧译法,就是 `drift`(`driftTerms` 列出 id、旧、新)。术语表在运行之外被改过时 `scan` 头部会写 `glossary … (changed outside a run)`。**`interrupted` 也由 `scan` 判定**:台账里某文档最后一个事件是 `doc_start`、且没有运行锁在持有(锁只按年龄判断)→ `interrupted`,`attempts` 按未完成的 `doc_start` 连续次数累加,达到 3 记 `blocked`。台账只有 `doc_start`(一次刚开始的运行)而没有完成事件时,不会据此重建快照。
+   `drift` 由 `scan` 判定,两个来源:(a) 快照里记录了译成时每个术语的译法(`termTargets`),术语表里该术语的 `target` 后来变了、而译文里仍含旧译法;(b) 术语被 `glossary revert --to source` 回退为英文,`changes.jsonl` 的 revert 行记着旧译法 `from`,已完成译文仍含它、源文正文用到该术语、且快照里没有 `reviewedTerms[id] === from` 的记录(没有 `termTargets` 的文档也判)。两者都只看 `fresh` 文档;`edited` 文档不判、不改。`driftTerms` 列出 id、旧、新。`terms-only` 修复落账时写 `reviewedTerms`(本篇审过的旧译法)与 `termTargets`(英文目标),所以修复后不再重判,普通词义的旧译法也不会造成循环。术语表在运行之外被改过时 `scan` 头部会写 `glossary … (changed outside a run)`。**`interrupted` 也由 `scan` 判定**:台账里某文档最后一个事件是 `doc_start`、且没有运行锁在持有(锁只按年龄判断)→ `interrupted`,`attempts` 按未完成的 `doc_start` 连续次数累加,达到 3 记 `blocked`。台账只有 `doc_start`(一次刚开始的运行)而没有完成事件时,不会据此重建快照。
 
 5. **排序并按预算挑选**(`scan` 已按此挑好,输出的 `picked` 就是本次清单):`interrupted` 与 `stale` 优先,其次 `drift`,再次 `new` / `failed` / `missing`;`blocked` 跳过。同组内先按 profile 的 `priority` 分层(未匹配的为第 3 层),层内按 `bytes` 从小到大(先落袋为安)。依次累加,遇到 `maxDocs` 或 `maxSourceBytes` 即停;单篇超过 `maxSourceBytes` 时允许单独处理一篇。`--max-docs`、`--max-bytes` 可覆盖 profile。
 6. **术语表就绪**:见 `glossary-and-style.md`("引导"与"人工修改的识别")。

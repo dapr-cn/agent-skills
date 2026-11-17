@@ -4,7 +4,7 @@
 
 ## 1. 术语表 `glossary.json`
 
-每次修改后 `version` 加 1,并往 `changes.jsonl` 追加一行 `{ts, run, op, id, ...}`(`op` 取 `add`、`bump`、`conflict`、`promote`、`external-edit`、`maintain`)。
+每次修改后 `version` 加 1,并往 `changes.jsonl` 追加一行 `{ts, run, op, id, ...}`(`op` 取 `add`、`bump`、`conflict`、`promote`、`demote`(audit 降级或移除)、`revert`(`glossary revert` 的人工决定)、`external-edit`、`maintain`)。
 
 ```json
 {
@@ -68,7 +68,7 @@
 
 - 相同 → 没有人动过。
 - 不同,且台账里没有对应的 `glossary_change` → 视为人工修改:记 `glossary_change`(`op: external-edit`),`version` 加 1,更新 `glossarySha256`。
-- 漂移由 `tr.mjs scan` 自动判定(快照里每篇文档记着译成时的 `termTargets`,与当前术语表对比,译文里仍含旧译法的标为 `drift`),不用再靠推断。`drift` 文档走"只替换术语"的修复(`next` 生成 `mode: terms-only` 的任务),不重译。
+- 漂移由 `tr.mjs scan` 自动判定(快照里每篇文档记着译成时的 `termTargets`,与当前术语表对比;以及被 `glossary revert --to source` 回退为英文的术语,其旧译法仍在已完成译文里且源文用到该术语的文档),不用再靠推断。`drift` 文档走"只替换术语"的修复(`next` 生成 `mode: terms-only` 的任务),不重译。修复时只换术语用法:普通词义(如 `主题` 作 theme/subject、`协调` 作普通动词、`重试策略` 泛指 retry strategies)保留原样,并在 `result.keptTerms` 里列出 id、句子与理由;标题换了则同文档的 `#锚点` 同步改。修复落账后记 `reviewedTerms`,保留下来的普通词义不会让文档再次成为 drift。
 
 ## 5. 风格笔记 `style.md`
 

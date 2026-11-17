@@ -1,6 +1,6 @@
 # `tr.mjs`:命令参考
 
-`SD/scripts/tr.mjs`,只依赖 Node 内置模块,在任意目录都能运行(仓库根由 `--profile` 的路径推断,或用 `--repo` 指定)。`scan`、`status`、`check` 只读;`init`、`adopt`、`next`、`assemble`、`finalize`、`fail`、`glossary merge` 才写,且只写 profile 声明的范围(状态目录、译文落点、草稿)。
+`SD/scripts/tr.mjs`,只依赖 Node 内置模块,在任意目录都能运行(仓库根由 `--profile` 的路径推断,或用 `--repo` 指定)。`scan`、`status`、`check` 只读;`init`、`adopt`、`next`、`assemble`、`finalize`、`fail`、`glossary merge` 才写;`glossary revert`、`orphan prune` 不加 `--dry-run` 才写(`glossary audit`、`bootstrap` 要 `--apply`)。写入只限 profile 声明的范围(状态目录、译文落点、草稿)。
 
 通用选项:
 
@@ -83,9 +83,9 @@
 
 ## `finalize` / `fail`
 
-`finalize --job <job.json> [--run <id>] [--model M] [--retries N] [--seconds S] [--tokens-in N] [--tokens-out N] [--flags '["…"]']`:确认源文自任务生成后没变、草稿通过硬校验,然后原子写入最终路径、删除草稿、记账(哈希由脚本算)、保存源文基线副本(`keepBaseSource`)、记录本篇用到的术语译法(`termTargets`,供漂移检测)和成本字段。成本字段取自 `result.json`,命令行可覆盖。软校验的发现与 subagent 的 `flags` 合并成 `flags`,有则记 `done_flagged`;环境类提示(`anchor-check-skipped`)只进输出的 `warnings`。
+`finalize --job <job.json> [--run <id>] [--model M] [--retries N] [--seconds S] [--tokens-in N] [--tokens-out N] [--flags '["…"]']`:确认源文自任务生成后没变、草稿通过硬校验,然后原子写入最终路径、删除草稿、记账(哈希由脚本算)、保存源文基线副本(`keepBaseSource`)、记录本篇用到的术语译法(`termTargets`,供漂移检测)和成本字段。`terms-only` 任务落账时,还记 `reviewedTerms`(本篇已审过的旧译法:之后这些旧译法即使还在译文里,也不再判 drift),并在输出里回显 `result.keptTerms`(保留的普通词义)。成本字段取自 `result.json`,命令行可覆盖。软校验的发现与 subagent 的 `flags` 合并成 `flags`,有则记 `done_flagged`;环境类提示(`anchor-check-skipped`)只进输出的 `warnings`。
 
-**术语增长是 `finalize` 的一部分**:`result.json` 里的 `termCandidates` 在文档被接受时并入术语表(规则同 `glossary merge`:新词入库、同译法累计、译法不同只记冲突、从不改首选译法)。这是为了让增长不依赖编排者记得再调一次命令。细节:① 术语表不存在时自动创建;② 新词的译法与另一个源词撞车(`collision`)时不入库,该文档带 `term-collision` 标记;③ 本篇用到的术语(含这篇自己新引入的)按合并后的术语表记进 `termTargets`,之后改了这些术语的译法就会触发 `drift`;④ 写完把 `result.json` 标 `mergedAt`,不会重复合并,`ok: false` 的结果不合并;⑤ 取术语表锁:同一个 `--run` 持有的锁直接沿用,被**别的**运行占着时,文档照常记账,候选留在 `result.json` 里,输出的 `glossary.reason` 说明,之后用 `glossary merge --job-dir` 补;⑥ 术语候选要先过**质量闸门**(筛选 → 撞车 → 暂存,见 `glossary-and-style.md` 第 3 节):首次出现只进 `glossary/pending.json`,`promoteAfter`(默认 2)篇文档一致才升为正式术语;没有自己候选的文档也会参与"靠使用确认"。⑦ 输出里的 `glossary` 字段汇报 `merged`、`version`、`added`(含升级的)、`promoted`、`reused`、`conflicts`、`staged`、`confirmed`、`pending`(待定总数)、`rejected`(逐条带原因)、`collisions`。关闭:`--no-glossary`(单次)或 profile `autoGlossary: false`(整个仓库)。`fail --job <job.json> --reason "<why>"`:`attempts` 加 1,记 `failed`,第 3 次记 `blocked`;草稿保留。
+**术语增长是 `finalize` 的一部分**:`result.json` 里的 `termCandidates` 在文档被接受时并入术语表(规则同 `glossary merge`:新词入库、同译法累计、译法不同只记冲突、从不改首选译法)。这是为了让增长不依赖编排者记得再调一次命令。细节:① 术语表不存在时自动创建;② 新词的译法与另一个源词撞车(`collision`)时不入库,该文档带 `term-collision` 标记;③ 本篇用到的术语(含这篇自己新引入的)按合并后的术语表记进 `termTargets`,之后改了这些术语的译法就会触发 `drift`;④ 写完把 `result.json` 标 `mergedAt`,不会重复合并,`ok: false` 的结果不合并;⑤ 取术语表锁:同一个 `--run` 持有的锁直接沿用,被**别的**运行占着时,文档照常记账,候选留在 `result.json` 里,输出的 `glossary.reason` 说明,之后用 `glossary merge --job-dir` 补;⑥ 术语候选要先过**质量闸门**(筛选 → 撞车 → 暂存,见 `glossary-and-style.md` 第 3 节):首次出现只进 `glossary/pending.json`,`promoteAfter`(默认 2)篇文档一致才升为正式术语;没有自己候选的文档也会参与"靠使用确认"。⑦ 输出里的 `glossary` 字段汇报 `merged`、`version`、`added`(含升级的)、`promoted`、`reused`、`conflicts`、`staged`、`confirmed`、`pending`(待定总数)、`rejected`(逐条带原因)、`collisions`。关闭:`--no-glossary`(单次)或 profile `autoGlossary: false`(整个仓库)。`fail --job <job.json> --reason "<why>"`:`attempts` 加 1,记 `failed`,第 3 次记 `blocked`;草稿保留。`terms-only` 任务失败记 `drift`(仍是待修复的术语漂移,下次照样 `terms-only`,不退回整篇重译),第 3 次同样记 `blocked`。
 
 ## `glossary merge`
 
@@ -101,7 +101,28 @@
 - **移除**(`demote … to: removed`):没有证据也该去掉的"不是术语"——筛选规则不通过(`generic`、`identifier`、`untranslated`、`too-long`…);不翻译名称同样检查,但 CamelCase 的品牌名(`OmniRoute`、`OpenAI`)不算标识符。
 - **退回待定**(`to: pending`):`origin: auto` 的术语,在已完成的译文里"源文含该词且译文用了该译法"的文档少于 `--min-docs`(默认 `glossary.promoteAfter`)篇。它连同证据(用到它的文档)进 `pending.json`,之后任何一篇文档用同样的译法就会自动重新升级。
 - **保留并只报告**:`origin: human`、`locked`,以及来自上游译文的 `bootstrap` 条目(不要求证据,只过静态筛选)。同一译法对应多个源词(`collision`)、术语在文档里出现但译文没用该译法(`inconsistent`)也只报告。
+- **保留**:已用 `glossary revert --to source` 回退为英文的术语(译法等于源词,且 do-not-translate 里有它)是有意的决定:不判证据,也不当作"不翻译的普通词"移除。
 `--static-only` 只应用静态筛选,不按证据降级(没有已完成的译文时用);否则没有任何已完成译文会直接退出 2,免得把所有 auto 术语都误判为"没证据"。`--apply` 一次升一个版本,写 `changes.jsonl`(`op: demote`)、台账、并同步快照里的术语表版本与哈希(不会被当成人工修改);取运行锁。
+
+## `glossary revert`
+
+`glossary revert --profile <p> --to source|remove (--ids <term>[,<term>…] | --ids-from <file>) [--reason "<text>"] [--locale L] [--run <id>] [--dry-run] [--json]`
+
+按人的决定改术语,不靠证据。`--ids` 是术语的 `id`(源词小写、空格转连字符,如 `drain`、`own-history`);`--ids-from` 每行一个(逗号也可,`#` 后是注释)。**不加 `--dry-run` 才写**,`--dry-run` 只报告。
+
+- `--to source`:**保留英文原文**。术语的 `target` 改为源词本身,并在 `doNotTranslate` 里加一条同名条目(`origin: human`),之后的翻译按原样保留这个词。`note` 追加 `kept in English: <reason>`。
+- `--to remove`:删除该术语行;同一 `id` 的待定候选(`pending.json` 里的 `kind: term`)一并撤回,避免"靠使用确认"把旧译法再升上来。删除不加 do-not-translate。
+
+行为:
+- `locked: true` 与 `origin: human` 的条目**跳过并报告**(`skipped`),不改。找不到的 `id` 报告 `not-found`,不静默忽略。已经是目标状态的报告 `already`,不写。
+- 写入路径与 `glossary audit --apply` 相同:`glossary.json`(`version` 加 1)、`changes.jsonl`(`op: revert`,带 `from`、`to`、`reason`)、台账 `glossary_change`(`note` 以 `revert (source|remove):` 开头),并同步快照的 `glossaryVersion` / `glossarySha256`(不会被当成人工修改);取运行锁,被占用退出 3。写入前在锁内重读术语表,不沿用扫描前的内存副本。
+- **已完成译文不被改动,也不重译。** `--to source` 之后,下次 `scan` 把满足三条的已完成译文判为 `drift`:① 译文里仍含旧译法(`changes.jsonl` 的 revert 行里的 `from`);② 源文正文确实用到该术语(代码与行内代码不算);③ 该旧译法没有被 `reviewedTerms` 记为已审。快照没有 `termTargets` 的文档(adopt 基线、更早的记录)也照样判。`edited`(人手改过)的文件不判、不改。修复只替换术语用法,普通词义(如 `主题` 作 theme)保留并在 `keptTerms` 里列出。命令输出 `finished translations that record or still show a reverted term`:有多少篇记过或仍显示这些术语、其中多少篇会被判 drift,逐条列出(`--json` 的 `affected.rows`,每行带 `old` 与 `drift`)。`--to remove` 不产生 drift(术语已不在表里),只报告引用篇数。
+
+## `orphan prune`
+
+`orphan prune --profile <p> [--locale L] [--only <glob>]… [--only-from <file>] [--run <id>] [--dry-run] [--json]`
+
+清理 **orphan 记录**:快照里有、源发现里已无的文档。只有同时满足"译文文件也已不在磁盘上"的记录才会移除(`doc_orphan_pruned` 台账行,快照经备份轮转后写入)。**译文文件仍在磁盘上的 orphan 一律不动**,在输出的 `kept` 里列出,留给人决定是采纳回源、还是删文件。`--only` 是 glob(可重复),`--only-from` 是每行一篇的清单,两者都只缩小范围。`--dry-run` 只报告;不加才写。取运行锁。台账里的 `doc_orphan_pruned` 在重放时删除对应记录,重建快照不会把它带回来。`state/base/` 下的基线副本与译文文件都不删。
 
 ## `glossary bootstrap`
 
